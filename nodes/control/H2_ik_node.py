@@ -13,7 +13,7 @@ Subscribes to:
     Right hand: x=0.310, y=-0.183, z=0.214
 
 Publishes to:
-  /arm_joints (sensor_msgs/JointState) - arm joint angles in RADIANS for Isaac Sim
+  /joint_command (sensor_msgs/JointState) - arm joint angles in RADIANS for Isaac Sim
 
 Key behaviours:
   - Left and right arms solved INDEPENDENTLY
@@ -77,7 +77,7 @@ IK_EPS_POS              = 1e-3    # 1mm position convergence
 IK_EPS_ROT              = 1e-2    # rotation convergence
 IK_DT                   = 0.5     # larger step for faster convergence
 IK_DAMP                 = 1e-6
-REACHABILITY_THRESH_M   = 0.03   # 30mm — reject if final error exceeds this
+REACHABILITY_THRESH_M   = 0.05   # 30mm — reject if final error exceeds this
 WAYPOINT_STEP_M         = 0.02   # 20mm Cartesian steps for trajectory seeding
 
 
@@ -155,7 +155,7 @@ class H2IKNode(Node):
         self.initialized = False
 
         # ── ROS2 ──────────────────────────────────────────────────────────────
-        self.pub = self.create_publisher(JointState, "/arm_joints", 10)
+        self.pub = self.create_publisher(JointState, "joint_command", 10)
 
         # Read actual joint positions from Isaac Sim on startup
         self.create_subscription(
@@ -171,7 +171,7 @@ class H2IKNode(Node):
         self.timer = self.create_timer(1.0 / PUBLISH_HZ, self.tick)
         self.get_logger().info(
             f"H2 IK node ready | {MAX_JOINT_VEL}°/s | "
-            f"{PUBLISH_HZ}Hz → /arm_joints | "
+            f"{PUBLISH_HZ}Hz → joint_command | "
             f"Waypoint step: {WAYPOINT_STEP_M*1000:.0f}mm | "
             f"Reject threshold: {REACHABILITY_THRESH_M*1000:.0f}mm"
         )
