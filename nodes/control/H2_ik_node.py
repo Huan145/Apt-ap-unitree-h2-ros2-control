@@ -155,7 +155,7 @@ class H2IKNode(Node):
         self.initialized = False
 
         # ── ROS2 ──────────────────────────────────────────────────────────────
-        self.pub = self.create_publisher(JointState, "joint_command", 10)
+        self.pub = self.create_publisher(JointState, "arm_joints", 10)
 
         # Read actual joint positions from Isaac Sim on startup
         self.create_subscription(
