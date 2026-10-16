@@ -187,9 +187,13 @@ def compute_grasp_quaternions(R_box_cam, T_pelvis_cam):
     """
     Compute left and right hand grasp quaternions in pelvis frame.
 
-    The box Y axis in pelvis frame defines the palm normal direction:
-      Left  hand: hand Y → -box_Y_pelvis  (palm faces toward box from +Y side)
-      Right hand: hand Y → +box_Y_pelvis  (palm faces toward box from -Y side)
+    Both hands get the SAME orientation: hand Y = box Y axis (sign flipped to
+    point left), fingers as close to +X pelvis as possible. For a box square to
+    the robot that is identity for both hands - what the old code produced
+    via its |w| < 0.1 fallback for the left hand; the old left formula
+    (hand Y -> -box_Y) is a 180 deg turn (fingers backward) that the fallback
+    only caught for box yaw < ~11 deg. FoundationPose may also flip the box Y
+    sign between frames (symmetric box); normalising the sign removes that.
 
     Fingers (+X) are kept pointing as close to +X pelvis (forward) as possible.
 
@@ -208,21 +212,10 @@ def compute_grasp_quaternions(R_box_cam, T_pelvis_cam):
     box_y_pelvis = R_pelvis_cam @ box_y_cam
     box_y_pelvis = box_y_pelvis / np.linalg.norm(box_y_pelvis)
 
-    # Left hand:  palm normal = -box_Y_pelvis (approaching from +Y side)
-    # Right hand: palm normal = +box_Y_pelvis (approaching from -Y side)
-    R_left  = rotation_from_y_axis(-box_y_pelvis)
-    R_right = rotation_from_y_axis( box_y_pelvis)
-
-    q_left  = rot_to_quat(R_left)
-    q_right = rot_to_quat(R_right)
-
-    # Safety: w ≈ 0 means ~180° rotation which is wrong — fall back to identity
-    if abs(q_left[3]) < 0.1:
-        q_left  = np.array([0., 0., 0., 1.])
-    if abs(q_right[3]) < 0.1:
-        q_right = np.array([0., 0., 0., 1.])
-
-    return q_left, q_right
+    if box_y_pelvis[1] < 0:              # box Y sign is arbitrary -> make it point left
+        box_y_pelvis = -box_y_pelvis
+    q = rot_to_quat(rotation_from_y_axis(box_y_pelvis))
+    return q, q
 
 
 # ── Overlay drawing ───────────────────────────────────────────────────────────
@@ -308,6 +301,7 @@ class PoseOverlayVisualizerTracking(Node):
         super().__init__('pose_overlay_visualizer_tracking')
 
         self.latest_pose       = None
+        self.latest_stamp      = None   # image time of the detection (TF is looked up at this time)
         self.latest_box_size   = None
         self.last_publish_time = 0.0
         self.MIN_INTERVAL      = 0.05   # 20 Hz cap
@@ -343,8 +337,19 @@ class PoseOverlayVisualizerTracking(Node):
             '  Intrinsics   : waiting for /camera_info...'
         )
 
-    def _get_T_pelvis_cam(self):
+    def _get_T_pelvis_cam(self, stamp=None):
+        """Camera pose in the pelvis frame at `stamp` (the image the box pose came
+        from); falls back to the latest TF if that time is not in the buffer."""
         try:
+            if stamp is not None:
+                try:
+                    ts = self.tf_buffer.lookup_transform(
+                        PELVIS_FRAME, CAMERA_FRAME, rclpy.time.Time.from_msg(stamp),
+                        timeout=rclpy.duration.Duration(seconds=0.1))
+                    return transform_stamped_to_matrix(ts)
+                except tf2_ros.ExtrapolationException:
+                    self.get_logger().warn('TF at detection time not available - using latest',
+                                           throttle_duration_sec=5.0)
             ts = self.tf_buffer.lookup_transform(
                 PELVIS_FRAME, CAMERA_FRAME,
                 rclpy.time.Time(),
@@ -389,6 +394,7 @@ class PoseOverlayVisualizerTracking(Node):
             det                  = msg.detections[0]
             self.latest_pose     = det.results[0].pose.pose
             self.latest_box_size = det.bbox.size
+            self.latest_stamp    = msg.header.stamp
             p = self.latest_pose.position
             s = self.latest_box_size
             self.get_logger().info(
@@ -419,7 +425,7 @@ class PoseOverlayVisualizerTracking(Node):
                 img_bgr, self.latest_pose, self.latest_box_size,
                 self.fx, self.fy, self.cx, self.cy)
 
-            T_pelvis_cam = self._get_T_pelvis_cam()
+            T_pelvis_cam = self._get_T_pelvis_cam(self.latest_stamp)
             if T_pelvis_cam is not None:
 
                 # ── Grasp positions in pelvis frame ───────────────────────────

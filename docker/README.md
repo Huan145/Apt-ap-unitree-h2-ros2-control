@@ -17,28 +17,39 @@ the same NVIDIA base image.
 Container flags are fixed at creation time. `docker start` on an existing
 container reuses the flags it was created with — you cannot add mounts or
 environment variables to it. If any of the settings below change, create a
-new container rather than restarting the old one.
+new container rather than restarting the old one:
+
+    docker ps -a --filter name=isaac_ros_fp   # does one exist?
+    docker rm -f isaac_ros_fp                 # image and mounted workspace are kept
 
 First copy the DDS profile into the mounted workspace (see the network
 prerequisites in the main README):
 
     cp ~/.ros/fastdds_lan_only.xml ~/workspaces/isaac_ros-dev/
 
-Then, on the perception machine:
+Then, on the perception machine (runs on GPU 0 only, leaving the other GPU
+free for other processes):
 
     docker run -it \
       --name isaac_ros_fp \
-      --gpus all \
+      --gpus '"device=0"' \
+      -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
+      -e CUDA_VISIBLE_DEVICES=0 \
       --network host \
       --ipc host \
       --privileged \
-      -v /home/<user>/workspaces/isaac_ros-dev:/workspaces/isaac_ros-dev \
+      -v $HOME/workspaces/isaac_ros-dev:/workspaces/isaac_ros-dev \
       -e ISAAC_ROS_WS=/workspaces/isaac_ros-dev \
       -e FASTRTPS_DEFAULT_PROFILES_FILE=/workspaces/isaac_ros-dev/fastdds_lan_only.xml \
       isaac_ros_foundationpose_custom:v1 \
       bash
 
 Key points:
+- `--gpus '"device=0"'` gives the container GPU 0 only. `--privileged` can
+  still expose every GPU's device files, so `CUDA_DEVICE_ORDER=PCI_BUS_ID` and
+  `CUDA_VISIBLE_DEVICES=0` pin CUDA to the same GPU 0 that host `nvidia-smi`
+  shows. To use all GPUs instead, replace those three lines with `--gpus all`.
+  Check with `nvidia-smi` on the host while the pipeline runs.
 - The host workspace is mounted at `/workspaces/isaac_ros-dev` inside the
   container. All paths in the launch file are relative to this.
 - `ISAAC_ROS_WS` is passed in so the launch file picks it up.
@@ -55,7 +66,6 @@ To reattach to a running container:
 
 Inside the container:
 
-    export ROS_DOMAIN_ID=99
     ros2 launch /workspaces/isaac_ros-dev/foundationpose_klt_tracking.launch.py
 
 Verify data is arriving before launching:

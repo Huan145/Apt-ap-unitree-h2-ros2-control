@@ -21,11 +21,17 @@ Perception chain (KLT box pose):
                        |->  /target_pose_left        (grasp pose, pelvis frame)
                        |->  /target_pose_right
 
-Control chain:
+Control chain (box pickup, robot balancing):
 
-    /target_pose_left|right  ->  H2_ik_node  ->  /arm_joints  ->  Isaac Sim
-    H2_lift_node             ->  hardcoded box-lift sequence
-    h2_fullbody_controller   ->  RL locomotion policy (joint_states + IMU)
+    /target_pose_left|right  ->  H2_pickup_sequencer  ->  /arm_targets (14 arm joints)
+                                                      ->  /load_expected (lift flag)
+    /joint_states + /imu + /arm_targets + /load_expected
+                             ->  H2_balance_controller  ->  /joint_command (all 31)  ->  Isaac Sim
+
+Other control nodes:
+
+    h2_fullbody_controller   ->  RL locomotion policy (joint_states + IMU, /cmd_vel, /head_pitch_cmd)
+    H2_ik_node               ->  arm IK only, torso pinned (/arm_joints)
 
 ## Machines
 
@@ -33,6 +39,8 @@ Control chain:
 |---|---|---|
 | Sim / control | 99 | Isaac Sim, control nodes, semantic mask, visualizer |
 | Perception | 0 | FoundationPose container |
+
+    export ROS_DOMAIN_ID=99
 
 The domains are isolated by design; topics are forwarded with the standard
 `domain_bridge` package.
@@ -50,8 +58,9 @@ results (/tracking/output, /tracking_visualization) back from domain 0 to 99.
 | Node | Env | Purpose |
 |---|---|---|
 | `nodes/control/h2_fullbody_controller.py` | `h2_rl` | RL locomotion policy |
-| `nodes/control/H2_ik_node.py` | `ik_env` | arm IK to grasp poses |
-| `nodes/control/H2_lift_node.py` | `ik_env` | hardcoded box-lift sequence |
+| `nodes/control/H2_balance_controller.py` | `ik_env` | RL balance policy (legs/waist/head) + arm targets -> `/joint_command` |
+| `nodes/control/H2_pickup_sequencer.py` | `ik_env` | live-IK arm phases: wide, standoff, pinch, tilt, carry |
+| `nodes/control/H2_ik_node.py` | `ik_env` | arm IK to grasp poses (torso pinned, testing) |
 | `nodes/perception/semantic_mask_node.py` | `yolo-env` | Isaac Sim semantics -> binary mask |
 | `nodes/perception/pose_overlay_visualizer_tracking_grasp.py` | `yolo-env` | overlay + grasp poses |
 | `launch/foundationpose_klt_tracking.launch.py` | container | FoundationPose pipeline |
@@ -71,17 +80,22 @@ Every terminal needs the env activated, ROS 2 sourced, and the domain set:
 
 Nodes are currently run individually for testing.
 
+    # Semantic mask; target label set by TARGET_LABEL in the file (ik_env)
+    python3 nodes/perception/semantic_mask_node.py
+    
+    # Object pose visualizer (yolo-env)
+    python3 nodes/perception/pose_overlay_visualizer_tracking_grasp.py
+
     # RL locomotion (h2_rl env)
     python3 nodes/control/h2_fullbody_controller.py [--policy <file>]
 
-    # Arm IK, consumes grasp poses (ik_env)
+    # Box pickup: balance policy + arm sequencer (ik_env). Start the controller
+    # BEFORE pressing Play; start the sequencer once the robot stands steady.
+    python3 nodes/control/H2_balance_controller.py
+    python3 nodes/control/H2_pickup_sequencer.py      # flags + troubleshooting: nodes/control/DEPLOY_h2_pickup.md
+
+    # Arm IK only, torso pinned (ik_env)
     python3 nodes/control/H2_ik_node.py
-
-    # Box lift sequence (ik_env)
-    python3 nodes/control/H2_lift_node.py
-
-    # Semantic mask; target label set by TARGET_LABEL in the file (ik_env)
-    python3 nodes/perception/semantic_mask_node.py
 
 FoundationPose pipeline: see `docker/README.md` (runs inside the container).
 
@@ -93,7 +107,11 @@ FoundationPose pipeline: see `docker/README.md` (runs inside the container).
   workspace so it lands at `/workspaces/isaac_ros-dev/KLT_box/`. `klt_box.usd`
   is a self-contained USD for adding the box to new Isaac Sim scenes.
 - `assets/scenes/` - Isaac Sim scene USDs (flattened, self-contained)
-- `models/` - trained policies, not committed; see `models/README.md`
+- `models/h2_balance_box_pickup/` - balance policy (`policy.pt`) + `policy_io.json`
+  (joint order, gains, obs layout) loaded by `H2_balance_controller.py` and
+  `H2_pickup_sequencer.py`
+- `models/h2_walking/` - locomotion policy for `h2_fullbody_controller.py`, not
+  committed; see `models/README.md`
 - FoundationPose weights are not committed; download from NVIDIA NGC into the
   container workspace (see `docker/README.md`)
 

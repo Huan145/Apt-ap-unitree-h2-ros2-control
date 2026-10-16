@@ -22,3 +22,7 @@ rosbag2_*/
 # Model weights — see models/README.md
 models/*.pt
 models/*.onnx
+
+# policies used by the nodes (keep in git)
+!models/h2_balance_box_pickup/policy.pt
+!models/h2_walking/policy.pt
