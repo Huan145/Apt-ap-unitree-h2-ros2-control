@@ -1,28 +1,66 @@
 #!/usr/bin/env python3
 """
-H2 Local Navigator Node — verbose debug build.
+H2 Local Navigator Node — verbose debug build, with head-pitch aiming.
 
 Same logic as before (stamped TF, EMA filter, rotate/approach/align state
 machine, hold-then-fail, global timeout) plus a debug layer:
 
   - EVERY cmd_vel change is logged immediately:  [CMD] vx vy wz | phase | why
   - Periodic heartbeat (default 2 Hz) with full state: phase, box estimate,
-    errors, distance/bearing, pose age, current cmd
+    errors, distance/bearing, pose age, current cmd, head cmd
   - Perception accounting: received / accepted / TF-failed / rejected
     counters, logged with each heartbeat; every accepted pose can be dumped
     raw-vs-filtered with log_poses:=true
-  - Service calls, phase transitions, terminal states all logged (as before)
+  - Service calls, phase transitions, terminal states all logged
+
+HEAD AIMING:
+  While a run is active, publishes std_msgs/Float64 on `head_pitch_cmd`
+  (consumed by h2_fullbody_controller.py).
+
+  head_mode:=center (default) — visual servo, keeps the box center in the
+  vertical middle of the image. Uses the box position in the camera optical
+  frame (x right, y down, z fwd): err = atan2(y, z). Target = head angle
+  measured AT IMAGE TIME (from /joint_states history) + head_gain * err,
+  which compensates tracker latency. Independent of camera mount tilt and
+  of head-TF accuracy. Falls back to geometry until joint_states arrive.
+
+  head_mode:=geometry — the pitch is computed from the pelvis-frame box
+  estimate:
+
+      elev = atan2(cam_z - box_z, horizontal distance cam -> box)
+      cmd  = head_pitch_sign * (elev - head_pitch_offset), clamped
+
+  cam position comes from the same stamped pelvis<-Camera TF used for the
+  box estimate. Box height is EMA-filtered like x/y.
+  - succeeded: head is held at its last angle (head_hold_after_done) so the
+    grasp pipeline still sees the box. Cancel releases it.
+  - cancel / failed: publishes NaN -> controller slews the head back to
+    default and returns it to the policy.
+
+  Tuning params:
+    head_enable         on/off (default true)
+    head_pitch_sign     +1 if a POSITIVE head_pitch_joint looks DOWN (verify!)
+    head_pitch_offset   camera mount pitch below head forward axis at joint=0,
+                        rad (camera already tilted down -> positive offset)
+    head_pitch_min/max  clamp, rad (keep inside controller + URDF limits)
+    head_min_horiz      min horizontal distance used (avoids pitch blowup
+                        right above the box), m
+    head_deadband       don't re-aim for changes smaller than this, rad
 
 Debug params:
   log_period_s   heartbeat interval, seconds sim time (default 0.5)
-  log_poses      log every accepted pose raw vs filtered (default false —
-                 very noisy, enable when debugging perception jitter)
+  log_poses      log every accepted pose raw vs filtered (default false)
 
-Everything logs at INFO so it shows without changing ROS log levels.
+Start a run:
+  ros2 service call /h2_local_navigator/start std_srvs/srv/Trigger
+Cancel:
+  ros2 service call /h2_local_navigator/cancel std_srvs/srv/Trigger
 """
 
+import bisect
 import json
 import math
+from collections import deque
 from enum import Enum
 
 import numpy as np
@@ -32,7 +70,8 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 
 import tf2_ros
 from geometry_msgs.msg import Twist, PointStamped
-from std_msgs.msg import String
+from std_msgs.msg import String, Float64
+from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
 from vision_msgs.msg import Detection3DArray
 
@@ -93,9 +132,9 @@ class H2LocalNavigator(Node):
         p("camera_frame", "Camera")
         p("control_rate_hz", 20.0)
 
-        p("standoff_x", 0.35)
+        p("standoff_x", 0.38)
         p("v_min", 0.17)
-        p("v_max", 0.30)
+        p("v_max", 0.50)
         p("w_min", 0.25)
         p("w_max", 0.50)
 
@@ -107,9 +146,7 @@ class H2LocalNavigator(Node):
                                        # before lateral motion is allowed again
         p("kp_ang", 1.5)
         p("kp_perp", 0.6)              # approach-phase weight on squaring to
-                                       # the box face (eyaw) alongside bearing,
-                                       # so the robot arrives perpendicular and
-                                       # does less rotating up close
+                                       # the box face (eyaw) alongside bearing
 
         p("pos_tol", 0.05)
         p("yaw_tol", math.radians(4))
@@ -117,14 +154,31 @@ class H2LocalNavigator(Node):
         p("bearing_gate", math.radians(30))
         p("settle_cycles", 20)
         p("settle_hyst", 1.4)          # once settling, break only if error
-                                       # exceeds tol * this factor (kills
-                                       # livelock at the tolerance boundary)
+                                       # exceeds tol * this factor
 
         p("nav_timeout_s", 60.0)
         p("pose_timeout", 0.8)
         p("lost_grace_s", 8.0)
         p("pose_lpf_alpha", 0.35)
         p("min_horizontal_y", 0.20)
+
+        # head aiming
+        p("head_enable", True)
+        p("head_pitch_topic", "head_pitch_cmd")
+        p("head_pitch_sign", 1.0)      # +1: positive joint angle looks DOWN
+        p("head_pitch_offset", 0.0)    # rad, camera mount tilt at joint=0
+        p("head_pitch_min", -0.5)
+        p("head_pitch_max", 0.5)
+        p("head_min_horiz", 0.25)
+        p("head_deadband", math.radians(1.0))
+        p("head_hold_after_done", True)
+        p("head_mode", "center")       # "center": keep box at image center
+                                       # (visual servo, default)
+                                       # "geometry": aim via pelvis-frame TF
+        p("head_gain", 0.7)            # center mode: fraction of the image
+                                       # error corrected per new pose (<1 damps)
+        p("head_joint", "head_pitch_joint")
+        p("joint_states_topic", "joint_states")
 
         # debug layer
         p("log_period_s", 0.5)
@@ -153,6 +207,22 @@ class H2LocalNavigator(Node):
         self.log_period_s = g("log_period_s")
         self.log_poses = g("log_poses")
 
+        self.head_enable = bool(g("head_enable"))
+        self.head_sign = float(g("head_pitch_sign"))
+        self.head_offset = float(g("head_pitch_offset"))
+        self.head_min = float(g("head_pitch_min"))
+        self.head_max = float(g("head_pitch_max"))
+        self.head_min_horiz = float(g("head_min_horiz"))
+        self.head_deadband = float(g("head_deadband"))
+        self.head_hold_after_done = bool(g("head_hold_after_done"))
+        self.head_mode = str(g("head_mode")).lower()
+        if self.head_mode not in ("center", "geometry"):
+            self.get_logger().warn(
+                f"unknown head_mode '{self.head_mode}' -> using 'center'")
+            self.head_mode = "center"
+        self.head_gain = float(g("head_gain"))
+        self.head_joint = g("head_joint")
+
         # state
         self.phase = Phase.IDLE
         self.phase_before_hold = None
@@ -160,25 +230,32 @@ class H2LocalNavigator(Node):
         self.start_time = None
         self.settle_count = 0
 
-        # sidestep duty-cycle: track continuous lateral motion and enforce
-        # a cooldown so the policy can't be commanded into a long sidestep
-        self.sidestep_active_since = None   # when current lateral run began
-        self.sidestep_pause_until = None    # cooldown end (clock time)
+        self.sidestep_active_since = None
+        self.sidestep_pause_until = None
 
-        self.bx = self.by = None
+        self.bx = self.by = self.bz = None
         self.gy = None
+        self.cam = None            # camera origin in pelvis frame (x,y,z)
         self.last_stamp = None
+        self.head_cmd = None       # last published head pitch, rad
+        # center mode: measured head angle history (sim-time ns, rad) so the
+        # image error can be applied relative to the head angle AT IMAGE
+        # TIME — compensates the tracker's latency, prevents oscillation
+        self.head_hist_t = deque(maxlen=1000)
+        self.head_hist_q = deque(maxlen=1000)
+        self.head_center_target = None
+        self.head_img_err = None   # last vertical image error, rad (+ = below)
 
         # debug state
         self.last_cmd = (0.0, 0.0, 0.0)
         self.last_heartbeat = None
-        self.n_rx = 0          # detections received
-        self.n_acc = 0         # accepted into the filter
-        self.n_tf_fail = 0     # dropped: TF lookup failed
-        self.n_rej_vert = 0    # dropped: box Y near-vertical
-        self.n_rej_nan = 0     # dropped: non-finite values from tracker
-        self.n_stamp_fallback = 0  # TF served with latest instead of stamp
-        self.n_cmd_pub = 0     # cmd_vel messages published
+        self.n_rx = 0
+        self.n_acc = 0
+        self.n_tf_fail = 0
+        self.n_rej_vert = 0
+        self.n_rej_nan = 0
+        self.n_stamp_fallback = 0
+        self.n_cmd_pub = 0
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -186,6 +263,9 @@ class H2LocalNavigator(Node):
         self.create_subscription(Detection3DArray, g("tracking_topic"),
                                  self.on_tracking, 10)
         self.pub_cmd = self.create_publisher(Twist, g("cmd_vel_topic"), 10)
+        self.pub_head = self.create_publisher(Float64, g("head_pitch_topic"), 10)
+        self.create_subscription(JointState, g("joint_states_topic"),
+                                 self.on_joint_states, 50)
         self.pub_point = self.create_publisher(PointStamped, "~/target_point", 10)
 
         latched = QoSProfile(depth=1,
@@ -205,6 +285,9 @@ class H2LocalNavigator(Node):
             f"v in [{self.v_min},{self.v_max}] m/s | "
             f"w in [{self.w_min},{self.w_max}] rad/s | "
             f"tol pos={self.pos_tol} m yaw={math.degrees(self.yaw_tol):.1f} deg | "
+            f"head {'ON' if self.head_enable else 'off'} "
+            f"(mode {self.head_mode}, sign {self.head_sign:+.0f}, offset {math.degrees(self.head_offset):.1f} deg, "
+            f"range [{math.degrees(self.head_min):.0f},{math.degrees(self.head_max):.0f}] deg) | "
             f"heartbeat every {self.log_period_s}s")
 
     # ---------------- perception ----------------
@@ -216,10 +299,7 @@ class H2LocalNavigator(Node):
         det = msg.detections[0]
         pose = det.results[0].pose.pose
 
-        # Gate 0: FoundationPose tracking can emit NaN when it diverges
-        # (typically right at track-loss boundaries). NaN poisons the EMA
-        # permanently and sails through shape() because every NaN comparison
-        # is False — reject before it touches anything.
+        # Gate 0: reject non-finite tracker output before it touches anything.
         vals = (pose.position.x, pose.position.y, pose.position.z,
                 pose.orientation.x, pose.orientation.y,
                 pose.orientation.z, pose.orientation.w)
@@ -256,35 +336,41 @@ class H2LocalNavigator(Node):
             y_h = -y_h
             flipped = True
 
+        # camera origin in pelvis frame at the image timestamp (for head aim)
+        self.cam = (float(T_pc[0, 3]), float(T_pc[1, 3]), float(T_pc[2, 3]))
+
         raw = (float(p_pel[0]), float(p_pel[1]), float(p_pel[2]))
-        # Self-heal: if the filter state is somehow non-finite (poisoned by a
-        # pre-guard NaN), discard it and reinitialize from this good pose.
+        # Self-heal a non-finite filter state.
         if self.bx is not None and not (
                 math.isfinite(self.bx) and math.isfinite(self.by)
+                and math.isfinite(self.bz)
                 and np.all(np.isfinite(self.gy))):
             self.get_logger().error(
                 "[POSE] filter state was non-finite — resetting filter")
-            self.bx = self.by = None
+            self.bx = self.by = self.bz = None
             self.gy = None
         if self.bx is None:
-            self.bx, self.by = raw[0], raw[1]
+            self.bx, self.by, self.bz = raw
             self.gy = y_h
             self.get_logger().info(
                 f"[POSE] first accepted pose: box at pelvis "
                 f"({raw[0]:.3f},{raw[1]:.3f},{raw[2]:.3f}) m, "
-                f"grasp axis ({y_h[0]:.2f},{y_h[1]:.2f})")
+                f"grasp axis ({y_h[0]:.2f},{y_h[1]:.2f}), "
+                f"camera at ({self.cam[0]:.3f},{self.cam[1]:.3f},{self.cam[2]:.3f}) m")
         else:
             a = self.alpha
             self.bx += a * (raw[0] - self.bx)
             self.by += a * (raw[1] - self.by)
+            self.bz += a * (raw[2] - self.bz)
             v = (1 - a) * self.gy + a * y_h
             self.gy = v / np.linalg.norm(v)
 
         self.n_acc += 1
+        self.update_center_target(pose.position, msg.header.stamp)
         if self.log_poses:
             self.get_logger().info(
-                f"[POSE] raw=({raw[0]:.3f},{raw[1]:.3f}) "
-                f"filt=({self.bx:.3f},{self.by:.3f}) "
+                f"[POSE] raw=({raw[0]:.3f},{raw[1]:.3f},{raw[2]:.3f}) "
+                f"filt=({self.bx:.3f},{self.by:.3f},{self.bz:.3f}) "
                 f"axis=({self.gy[0]:.2f},{self.gy[1]:.2f})"
                 f"{' [sign-flipped]' if flipped else ''}")
 
@@ -312,7 +398,7 @@ class H2LocalNavigator(Node):
             self.n_stamp_fallback += 1
             self.get_logger().warn(
                 "[TF] stamped lookup unavailable — using latest transform "
-                "(bias possible while moving)",
+                "(bias possible while moving / head tilting)",
                 throttle_duration_sec=5.0)
             return transform_to_matrix(ts)
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
@@ -337,6 +423,98 @@ class H2LocalNavigator(Node):
         phi = math.atan2(self.gy[1], self.gy[0])
         eyaw = wrap_half(phi - math.pi / 2)
         return float(t[0]), float(t[1]), eyaw
+
+    # ---------------- head aiming ----------------
+
+    def on_joint_states(self, msg: JointState):
+        if self.head_joint not in msg.name:
+            return
+        q = msg.position[msg.name.index(self.head_joint)]
+        if not math.isfinite(q):
+            return
+        t = rclpy.time.Time.from_msg(msg.header.stamp).nanoseconds
+        if t <= 0:
+            t = self.get_clock().now().nanoseconds
+        if self.head_hist_t and t < self.head_hist_t[-1]:
+            # sim time went backwards (Stop -> Play): drop stale history
+            self.head_hist_t.clear()
+            self.head_hist_q.clear()
+        self.head_hist_t.append(t)
+        self.head_hist_q.append(q)
+
+    def head_angle_at(self, t_ns):
+        """Measured head angle closest to sim time t_ns (None if no data)."""
+        if not self.head_hist_t:
+            return None
+        if t_ns <= 0:
+            return self.head_hist_q[-1]
+        ts = list(self.head_hist_t)
+        i = bisect.bisect_left(ts, t_ns)
+        if i <= 0:
+            return self.head_hist_q[0]
+        if i >= len(ts):
+            return self.head_hist_q[-1]
+        return (self.head_hist_q[i] if ts[i] - t_ns < t_ns - ts[i - 1]
+                else self.head_hist_q[i - 1])
+
+    def update_center_target(self, p_cam, stamp):
+        """Visual servo: box position in the camera OPTICAL frame
+        (x right, y down, z forward). Vertical angle off-center is
+        atan2(y, z); the head target is the head angle at image time plus
+        that error (times gain). Mount tilt and head-TF errors cancel out."""
+        if p_cam.z < 0.05:
+            return
+        self.head_img_err = math.atan2(p_cam.y, p_cam.z)   # + = box below center
+        t_img = rclpy.time.Time.from_msg(stamp).nanoseconds
+        q_img = self.head_angle_at(t_img)
+        if q_img is None:
+            self.get_logger().warn(
+                f"[HEAD] no '{self.head_joint}' in joint_states yet — "
+                f"center mode falls back to geometry",
+                throttle_duration_sec=5.0)
+            return
+        self.head_center_target = (
+            q_img + self.head_sign * self.head_gain * self.head_img_err)
+
+    def compute_head_pitch(self):
+        """Head pitch command for the current mode, clamped."""
+        if self.head_mode == "center" and self.head_center_target is not None:
+            return min(max(self.head_center_target, self.head_min), self.head_max)
+        return self.compute_head_pitch_geometry()
+
+    def compute_head_pitch_geometry(self):
+        """Joint angle that points the camera at the filtered box center."""
+        if self.bz is None or self.cam is None:
+            return None
+        cx, cy, cz = self.cam
+        horiz = max(math.hypot(self.bx - cx, self.by - cy), self.head_min_horiz)
+        elev = math.atan2(cz - self.bz, horiz)      # > 0: box below camera
+        cmd = self.head_sign * (elev - self.head_offset)
+        return min(max(cmd, self.head_min), self.head_max)
+
+    def publish_head(self, freeze=False):
+        if not self.head_enable:
+            return
+        if not freeze:
+            target = self.compute_head_pitch()
+            if target is not None and (
+                    self.head_cmd is None
+                    or abs(target - self.head_cmd) >= self.head_deadband):
+                if self.head_cmd is None:
+                    self.get_logger().info(
+                        f"[HEAD] aiming at box: {math.degrees(target):+.1f} deg")
+                self.head_cmd = target
+        if self.head_cmd is None:
+            return
+        self.pub_head.publish(Float64(data=float(self.head_cmd)))
+
+    def release_head(self, why):
+        if not self.head_enable:
+            return
+        self.pub_head.publish(Float64(data=float("nan")))
+        if self.head_cmd is not None:
+            self.get_logger().info(f"[HEAD] released ({why})")
+        self.head_cmd = None
 
     # ---------------- services ----------------
 
@@ -364,6 +542,7 @@ class H2LocalNavigator(Node):
     def on_cancel(self, req, resp):
         self.get_logger().info(f"[SRV] cancel requested | phase={self.phase.value}")
         self.publish_cmd(Twist(), "cancel")
+        self.release_head("cancel")
         self.set_phase(Phase.IDLE)
         resp.success = True
         resp.message = "Cancelled."
@@ -380,16 +559,13 @@ class H2LocalNavigator(Node):
     def gate_sidestep(self, vy_desired):
         """Duty-cycle limiter for lateral velocity. Caps magnitude to v_min
         and enforces sidestep_max_s of motion followed by sidestep_pause_s
-        of no lateral motion — the policy trips on long continuous sidesteps.
-        Fore/aft and yaw are unaffected; only vy is gated."""
+        of no lateral motion. Only vy is gated."""
         now = self.get_clock().now()
 
         if abs(vy_desired) < 1e-6:
-            # No sidestep wanted — end any active run, clear pause.
             self.sidestep_active_since = None
             return 0.0
 
-        # In cooldown? Suppress lateral motion until it expires.
         if self.sidestep_pause_until is not None:
             if now < self.sidestep_pause_until:
                 remaining = (self.sidestep_pause_until - now).nanoseconds * 1e-9
@@ -400,13 +576,11 @@ class H2LocalNavigator(Node):
             self.sidestep_pause_until = None
             self.sidestep_active_since = None
 
-        # Start a run if none active.
         if self.sidestep_active_since is None:
             self.sidestep_active_since = now
 
         run = (now - self.sidestep_active_since).nanoseconds * 1e-9
         if run >= self.sidestep_max_s:
-            # Hit the limit — force a pause.
             self.sidestep_pause_until = now + rclpy.duration.Duration(
                 seconds=self.sidestep_pause_s)
             self.sidestep_active_since = None
@@ -415,12 +589,16 @@ class H2LocalNavigator(Node):
                 f"{self.sidestep_pause_s}s pause")
             return 0.0
 
-        # Allowed: minimal-magnitude sidestep.
         return math.copysign(self.v_min, vy_desired)
 
     # ---------------- control loop ----------------
 
     def control_step(self):
+        if self.phase == Phase.DONE and self.head_hold_after_done:
+            # keep the head where it ended so the grasp stage sees the box;
+            # continuous publishing prevents the controller's timeout release
+            self.publish_head(freeze=True)
+            return
         if self.phase in (Phase.IDLE, Phase.DONE, Phase.FAILED):
             return
 
@@ -439,9 +617,6 @@ class H2LocalNavigator(Node):
             if self.phase != Phase.HOLD:
                 self.phase_before_hold = self.phase
                 self.hold_since = self.get_clock().now()
-                # A stationary robot's position cannot change during a
-                # perception gap — settle evidence from final_align stays
-                # valid across the hold.
                 self.set_phase(Phase.HOLD, preserve_settle=(
                     self.phase_before_hold == Phase.FINAL_ALIGN))
                 self.get_logger().warn(
@@ -455,6 +630,8 @@ class H2LocalNavigator(Node):
                     self.fail(f"Track lost for {held:.1f}s "
                               f"(> {self.lost_grace_s}s grace)")
                     return
+            # keep the head still while the tracker re-acquires
+            self.publish_head(freeze=True)
             self.publish_cmd(Twist(), "hold: stale pose")
             self.heartbeat(None, None, None, age)
             return
@@ -470,6 +647,7 @@ class H2LocalNavigator(Node):
 
         tx, ty, eyaw = self.compute_errors()
         self.publish_point(tx, ty)
+        self.publish_head()
 
         dist = math.hypot(tx, ty)
         bearing = math.atan2(ty, tx)
@@ -510,12 +688,6 @@ class H2LocalNavigator(Node):
                 cmd.linear.y = self.gate_sidestep(
                     self.shape(ty, self.kp_lin, self.v_min,
                                self.v_max, self.pos_tol * 2))
-                # Steer with two blended angular terms:
-                #   bearing -> keep the nose on the standoff point
-                #   eyaw    -> square the torso to the box face NOW, while
-                #              far and cheap to rotate, so final_align does
-                #              little turning up close (where 1/distance makes
-                #              rotation the main tracking-killer).
                 w_raw = self.kp_ang * bearing + self.kp_perp * eyaw
                 if abs(bearing) < self.yaw_tol * 2 and abs(eyaw) < self.yaw_tol:
                     cmd.angular.z = 0.0
@@ -527,9 +699,6 @@ class H2LocalNavigator(Node):
                        f"perp_err={math.degrees(eyaw):+.1f}")
 
         elif self.phase == Phase.FINAL_ALIGN:
-            # Hysteresis: while settling (cmd already zero), only break if
-            # the error exceeds tol * settle_hyst — otherwise estimator
-            # jitter exactly at the boundary livelocks settle/trim forever.
             hyst = self.settle_hyst if self.settle_count > 0 else 1.0
             ex_ok = abs(tx) < self.pos_tol * hyst
             ey_ok = abs(ty) < self.pos_tol * hyst
@@ -579,13 +748,19 @@ class H2LocalNavigator(Node):
             "dyaw_deg": round(math.degrees(eyaw), 2),
             "box_x_m": round(self.bx, 4),
             "box_y_m": round(self.by, 4),
+            "box_z_m": round(self.bz, 4),
+            "head_pitch_deg": (round(math.degrees(self.head_cmd), 2)
+                               if self.head_cmd is not None else None),
         }
         self.publish_result(result)
+        if not self.head_hold_after_done:
+            self.release_head("succeeded")
         self.get_logger().info(f"[DONE] standoff reached: {result}")
         self.log_counters()
 
     def fail(self, reason):
         self.publish_cmd(Twist(), f"failed: {reason}")
+        self.release_head("failed")
         self.set_phase(Phase.FAILED)
         self.publish_result({"outcome": "failed", "reason": reason})
         self.get_logger().error(f"[FAIL] {reason}")
@@ -595,9 +770,7 @@ class H2LocalNavigator(Node):
 
     def publish_cmd(self, cmd: Twist, why: str):
         """Single funnel for every cmd_vel publish — logs every CHANGE.
-        Hard-blocks non-finite commands: NaN reaching the policy's
-        observation vector NaNs the whole action output and drops the
-        robot instantly."""
+        Hard-blocks non-finite commands."""
         vx, vy, wz = cmd.linear.x, cmd.linear.y, cmd.angular.z
         if not (math.isfinite(vx) and math.isfinite(vy)
                 and math.isfinite(wz)):
@@ -628,12 +801,16 @@ class H2LocalNavigator(Node):
             geo = (f"target=({tx:+.3f},{ty:+.3f})m dist={math.hypot(tx, ty):.3f} "
                    f"bearing={math.degrees(math.atan2(ty, tx)):+.1f}deg "
                    f"dyaw={math.degrees(eyaw):+.1f}deg")
-        box = (f"box=({self.bx:+.3f},{self.by:+.3f}) "
+        box = (f"box=({self.bx:+.3f},{self.by:+.3f},{self.bz:+.3f}) "
                f"axis=({self.gy[0]:+.2f},{self.gy[1]:+.2f})"
                if self.bx is not None else "box=none")
+        head = (f"head={math.degrees(self.head_cmd):+.1f}deg"
+                if self.head_cmd is not None else "head=policy")
+        if self.head_img_err is not None:
+            head += f" img_err={math.degrees(self.head_img_err):+.1f}deg"
         c = self.last_cmd
         self.get_logger().info(
-            f"[HB] {self.phase.value} | {box} | {geo} | age={age:.2f}s | "
+            f"[HB] {self.phase.value} | {box} | {geo} | {head} | age={age:.2f}s | "
             f"cmd=({c[0]:+.3f},{c[1]:+.3f},{c[2]:+.3f}) | "
             f"rx={self.n_rx} acc={self.n_acc} tf_fail={self.n_tf_fail} "
             f"rej={self.n_rej_vert} nan={self.n_rej_nan} "
@@ -689,6 +866,7 @@ def main():
     finally:
         try:
             node.pub_cmd.publish(Twist())
+            node.pub_head.publish(Float64(data=float("nan")))
         except Exception:
             pass
         node.destroy_node()

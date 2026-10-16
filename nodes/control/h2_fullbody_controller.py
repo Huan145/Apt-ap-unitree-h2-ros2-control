@@ -14,33 +14,45 @@ Key architectural differences from the earlier h2_rl_policy_node.py:
   - use_sim_time=True -- all timing uses Isaac Sim's /clock, not wall time.
   - Uses an IMU sensor on the pelvis for angular velocity + orientation
     (gravity projection), and integrates linear acceleration for linear
-    velocity -- NOT an odometry node. Requires an IMU sensor + ROS2 Publish
-    IMU ActionGraph on the pelvis link (see setup notes at bottom of file).
+    velocity -- NOT an odometry node.
+
+HEAD PITCH OVERRIDE (new):
+  - Subscribes to std_msgs/Float64 on `head_pitch_cmd` (radians, joint angle).
+  - While commands arrive, head_pitch_joint is overridden: the head slews
+    toward the target at `head_rate` rad/s, clamped to
+    [head_pitch_min, head_pitch_max]. All other joints stay policy-driven.
+  - The override is written back INTO the policy's action vector, so the
+    policy's last_action observation stays consistent with what was actually
+    commanded.
+  - Release: send NaN, or stop publishing for `head_cmd_timeout` s. The head
+    then slews back to its default angle and control returns to the policy.
+  - Override starts from the MEASURED head angle, so there is no jump.
+
+Also new: on a backwards time jump (Isaac Stop -> Play while this node
+keeps running), integrator / last action / head override are reset.
 
 Confirmed against env.yaml (h2_flat, 2026-05-25_09-21-25 run):
   - sim.dt = 0.005, decimation = 4  -> policy runs at 50Hz, physics at 200Hz
   - actions.joint_pos: scale=0.5, offset=0.0, use_default_offset=True, joints=".*"
   - observations.policy: base_lin_vel, base_ang_vel, projected_gravity,
-    # velocity_commands, joint_pos_rel, joint_vel_rel, last_action
+    velocity_commands, joint_pos_rel, joint_vel_rel, last_action
     -- ALL have scale=null, clip=null (no hidden scaling anywhere)
-  - init_state.joint_pos confirms defaults for ALL non-zero joints, including
-    arm joints that were WRONG (left at 0.0) in the previous node version:
-      hip_pitch: -0.2, knee: 0.42, ankle_pitch: -0.23,
-      shoulder_pitch: 0.28, shoulder_roll: 0.16, elbow: 0.52
-  - usd_path confirmed: H2.usd (not H2_box.usd)
+  - init_state.joint_pos defaults (see DEFAULT_JOINT_POS)
 
-NOT yet applied anywhere (env.yaml confirms armature=0.01 on every actuator
-group; this is a separate PhysX joint attribute, not part of UsdPhysics
-DriveAPI, and still needs to be set via Script Editor if not already).
+Run (start BEFORE pressing Play in Isaac Sim):
+  python3 h2_fullbody_controller.py [--policy policy.pt]
+  # optional ROS params:
+  #   --ros-args -p head_pitch_min:=-0.5 -p head_pitch_max:=0.5 \
+  #              -p head_rate:=0.5 -p head_cmd_timeout:=1.0
 
-Run:
-  conda activate <ros2 + torch env>
-  source /opt/ros/jazzy/setup.bash
-  python3 h2_fullbody_controller.py
+Quick head test (robot standing):
+  ros2 topic pub -r 20 /head_pitch_cmd std_msgs/msg/Float64 "{data: 0.3}"
+  -> check which way the head moves; Ctrl-C -> head returns after timeout.
 """
 
 import argparse
 import io
+import math
 import os
 import numpy as np
 import rclpy
@@ -48,6 +60,7 @@ import torch
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import JointState, Imu
+from std_msgs.msg import Float64
 from message_filters import Subscriber, TimeSynchronizer
 
 
@@ -55,12 +68,8 @@ from message_filters import Subscriber, TimeSynchronizer
 # CONFIG
 # ============================================================================
 
-# ============================================================================
-# Policy is loaded from the repo's models/ folder (repo-relative, portable).
-# Select which policy with:  python3 h2_fullbody_controller.py --policy <file>
-# Default is models/policy.pt. Weights aren't committed — see models/README.md.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_MODELS_DIR = os.path.join(_REPO_ROOT, "models")
+_MODELS_DIR = os.path.join(_REPO_ROOT, "models/h2_walking")
 
 _parser = argparse.ArgumentParser()
 _parser.add_argument("--policy", default="policy.pt",
@@ -69,10 +78,10 @@ _args, _ = _parser.parse_known_args()
 POLICY_PATH = os.path.join(_MODELS_DIR, _args.policy)
 ACTION_SCALE = 0.5   # confirmed: actions.joint_pos.scale in env.yaml
 DECIMATION = 4       # confirmed: env.yaml decimation (policy runs every 4th tick)
+SIM_DT = 0.005       # confirmed: env.yaml sim.dt
+POLICY_DT = SIM_DT * DECIMATION   # 0.02 s
 NUM_JOINTS = 31
 
-# Joint order -- confirmed via robot.data.joint_names AND action_term._joint_names
-# (both identical, per earlier verification).
 JOINT_NAMES = [
     "left_hip_pitch_joint", "right_hip_pitch_joint", "waist_yaw_joint",
     "left_hip_roll_joint", "right_hip_roll_joint", "waist_roll_joint",
@@ -89,9 +98,6 @@ JOINT_NAMES = [
     "left_wrist_yaw_joint", "right_wrist_yaw_joint",
 ]
 
-# Default joint positions -- confirmed directly from env.yaml's
-# scene.robot.init_state.joint_pos. NOTE: shoulder_pitch/shoulder_roll/elbow
-# are NON-ZERO -- this was wrong (left at 0.0) in the previous node version.
 DEFAULT_JOINT_POS = {
     "left_hip_pitch_joint": -0.2, "right_hip_pitch_joint": -0.2, "waist_yaw_joint": 0.0,
     "left_hip_roll_joint": 0.0, "right_hip_roll_joint": 0.0, "waist_roll_joint": 0.0,
@@ -108,6 +114,8 @@ DEFAULT_JOINT_POS = {
     "left_wrist_yaw_joint": 0.0, "right_wrist_yaw_joint": 0.0,
 }
 
+HEAD_PITCH_JOINT = "head_pitch_joint"
+
 OBS_DIM = 3 + 3 + 3 + 3 + NUM_JOINTS + NUM_JOINTS + NUM_JOINTS  # 105
 
 
@@ -116,7 +124,7 @@ OBS_DIM = 3 + 3 + 3 + 3 + NUM_JOINTS + NUM_JOINTS + NUM_JOINTS  # 105
 # ============================================================================
 
 class H2FullbodyController(Node):
-    """Fullbody controller for the H2 humanoid, adapted from NVIDIA's H1 example."""
+    """Fullbody controller for the H2 humanoid, with external head-pitch override."""
 
     def __init__(self):
         super().__init__('h2_fullbody_controller')
@@ -126,8 +134,45 @@ class H2FullbodyController(Node):
             [rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)]
         )
 
+        # head override params
+        self.declare_parameter('head_pitch_topic', 'head_pitch_cmd')
+        self.declare_parameter('head_pitch_min', -0.5)   # rad — CHECK H2 URDF limits
+        self.declare_parameter('head_pitch_max', 0.5)    # rad — CHECK H2 URDF limits
+        self.declare_parameter('head_rate', 0.5)         # rad/s slew limit
+        self.declare_parameter('head_cmd_timeout', 1.0)  # s sim time -> release
+
         self._logger = self.get_logger()
 
+        self.joint_names = JOINT_NAMES
+        self.default_pos = np.array([DEFAULT_JOINT_POS[j] for j in JOINT_NAMES], dtype=np.float64)
+
+        # --- state (initialized before any subscription is created) ---
+        self._joint_command = JointState()
+        self._cmd_vel = Twist()
+        self._action_scale = ACTION_SCALE
+        self._previous_action = np.zeros(NUM_JOINTS)
+        self._policy_counter = 0
+        self._decimation = DECIMATION
+        self._last_tick_time = self.get_clock().now().nanoseconds * 1e-9
+        self._lin_vel_b = np.zeros(3)
+        self._dt = 0.0
+        self.action = np.zeros(NUM_JOINTS)
+
+        # --- head override state ---
+        g = lambda n: self.get_parameter(n).value
+        self._head_idx = JOINT_NAMES.index(HEAD_PITCH_JOINT)
+        self._head_min = float(g('head_pitch_min'))
+        self._head_max = float(g('head_pitch_max'))
+        self._head_rate = float(g('head_rate'))
+        self._head_timeout = float(g('head_cmd_timeout'))
+        self._head_override = False     # True while we own head_pitch_joint
+        self._head_target = None        # latest requested angle (None = release)
+        self._head_cur = 0.0            # angle currently commanded by override
+        self._head_last_msg = None      # rclpy Time of last valid command
+        self._head_meas = float(self.default_pos[self._head_idx])  # measured
+        self._head_releasing_logged = False
+
+        # --- ROS interfaces ---
         sim_qos_profile = rclpy.qos.QoSProfile(
             reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
             durability=rclpy.qos.DurabilityPolicy.VOLATILE,
@@ -136,6 +181,9 @@ class H2FullbodyController(Node):
 
         self._cmd_vel_subscription = self.create_subscription(
             Twist, 'cmd_vel', self._cmd_vel_callback, qos_profile=10)
+
+        self._head_subscription = self.create_subscription(
+            Float64, g('head_pitch_topic'), self._head_callback, qos_profile=10)
 
         self._joint_publisher = self.create_publisher(
             JointState, 'joint_command', qos_profile=sim_qos_profile)
@@ -151,32 +199,83 @@ class H2FullbodyController(Node):
         self.policy_path = self.get_parameter('policy_path').value
         self.load_policy()
 
-        self._joint_command = JointState()
-        self._cmd_vel = Twist()
-        self._action_scale = ACTION_SCALE
-        self._previous_action = np.zeros(NUM_JOINTS)
-        self._policy_counter = 0
-        self._decimation = DECIMATION
-        self._last_tick_time = self.get_clock().now().nanoseconds * 1e-9
-        self._lin_vel_b = np.zeros(3)
-        self._dt = 0.0
-        self.action = np.zeros(NUM_JOINTS)
-
-        self.joint_names = JOINT_NAMES
-        self.default_pos = np.array([DEFAULT_JOINT_POS[j] for j in JOINT_NAMES], dtype=np.float64)
-
         self._logger.info(
             f"Initializing H2FullbodyController: obs_dim={OBS_DIM}, "
-            f"action_dim={NUM_JOINTS}, decimation={self._decimation}"
+            f"action_dim={NUM_JOINTS}, decimation={self._decimation} | "
+            f"head override on '{g('head_pitch_topic')}' "
+            f"range [{self._head_min:+.2f},{self._head_max:+.2f}] rad, "
+            f"rate {self._head_rate} rad/s, timeout {self._head_timeout}s"
         )
+
+    # ------------------------------------------------------------------ inputs
 
     def _cmd_vel_callback(self, msg):
         self._cmd_vel = msg
+
+    def _head_callback(self, msg: Float64):
+        v = float(msg.data)
+        if not math.isfinite(v):
+            # explicit release request
+            if self._head_override and self._head_target is not None:
+                self._logger.info("[HEAD] release requested -> returning to default")
+            self._head_target = None
+            return
+        self._head_target = float(np.clip(v, self._head_min, self._head_max))
+        self._head_last_msg = self.get_clock().now()
+        self._head_releasing_logged = False
+        if not self._head_override:
+            self._head_override = True
+            self._head_cur = self._head_meas   # start from where the head IS
+            self._logger.info(
+                f"[HEAD] override engaged: from {self._head_cur:+.3f} "
+                f"toward {self._head_target:+.3f} rad")
+
+    # ------------------------------------------------------------------ head
+
+    def _update_head(self):
+        """Advance the head override by one policy step.
+        Returns the head angle to command, or None if the policy owns the head."""
+        if not self._head_override:
+            return None
+
+        default = float(self.default_pos[self._head_idx])
+        stale = self._head_target is None or self._head_last_msg is None
+        if not stale:
+            age = (self.get_clock().now() - self._head_last_msg).nanoseconds * 1e-9
+            stale = age > self._head_timeout
+
+        if stale and not self._head_releasing_logged:
+            self._logger.info("[HEAD] no command (timeout/release) -> slewing to default")
+            self._head_releasing_logged = True
+
+        goal = default if stale else self._head_target
+        step = self._head_rate * POLICY_DT
+        self._head_cur += float(np.clip(goal - self._head_cur, -step, step))
+
+        if stale and abs(self._head_cur - default) < 1e-3:
+            self._head_override = False
+            self._head_target = None
+            self._logger.info("[HEAD] override released -> policy controls head")
+            return None
+        return self._head_cur
+
+    # ------------------------------------------------------------------ main loop
+
+    def _reset_state(self):
+        self._lin_vel_b = np.zeros(3)
+        self._previous_action = np.zeros(NUM_JOINTS)
+        self.action = np.zeros(NUM_JOINTS)
+        self._policy_counter = 0
+        self._head_override = False
+        self._head_target = None
+        self._head_last_msg = None
 
     def _tick(self, joint_state: JointState, imu: Imu):
         now = self.get_clock().now().nanoseconds * 1e-9
         if now < self._last_tick_time:
             self._logger.error(f'{self._get_stamp_prefix()} Time jumped backwards. Resetting.')
+            self._reset_state()
+            self._last_tick_time = now
 
         self._dt = (now - self._last_tick_time)
         self._last_tick_time = now
@@ -203,8 +302,7 @@ class H2FullbodyController(Node):
             imu.linear_acceleration.z,
         ])
         # Naive integration -- drifts over long runs, matches the reference
-        # H1 implementation. Consider replacing with an odometry-based twist
-        # if drift becomes a problem over longer test durations.
+        # H1 implementation.
         self._lin_vel_b = lin_acc_b * self._dt + self._lin_vel_b
 
         ang_vel_b = np.array([
@@ -231,6 +329,8 @@ class H2FullbodyController(Node):
                 current_joint_pos[i] = joint_state.position[idx]
                 current_joint_vel[i] = joint_state.velocity[idx]
 
+        self._head_meas = float(current_joint_pos[self._head_idx])
+
         obs[12:12 + NUM_JOINTS] = current_joint_pos - self.default_pos
         obs[12 + NUM_JOINTS:12 + 2 * NUM_JOINTS] = current_joint_vel
         obs[12 + 2 * NUM_JOINTS:12 + 3 * NUM_JOINTS] = self._previous_action
@@ -247,8 +347,17 @@ class H2FullbodyController(Node):
         obs = self._compute_observation(joint_state, imu)
         if self._policy_counter % self._decimation == 0:
             self.action = self._compute_action(obs)
+            head = self._update_head()
+            if head is not None:
+                # Express the override in the policy's action space so that
+                # default_pos + action*scale == head, and last_action obs
+                # reflects what was really commanded.
+                self.action[self._head_idx] = (
+                    (head - self.default_pos[self._head_idx]) / self._action_scale)
             self._previous_action = self.action.copy()
         self._policy_counter += 1
+
+    # ------------------------------------------------------------------ utils
 
     def quat_to_rot_matrix(self, quat: np.ndarray) -> np.ndarray:
         q = np.array(quat, dtype=np.float64, copy=True)
@@ -291,32 +400,16 @@ if __name__ == '__main__':
 
 
 # ============================================================================
-# SETUP NOTES -- what changes vs. the odometry-based setup from before:
+# SETUP NOTES
 #
-# 1. ADD an IMU sensor: right-click /World/H2/pelvis (or wherever your
-#    pelvis prim lives) -> Create > Isaac > Sensors > Imu Sensor.
-#
-# 2. ADD a new ActionGraph ("ROS_Imu"), pipelineStage = pipelineStageOnDemand:
-#    On Physics Step -> Isaac Read IMU Node (IMU Prim = the sensor above,
-#    uncheck "Read Gravity" -- confirmed done) -> ROS2 Publish IMU (topic: "imu")
-#    Also wire Isaac Read Simulation Time -> ROS2 Publish IMU, with
-#    "Reset on Stop" checked on the Read Simulation Time node.
-#
-# 3. Your EXISTING /joint_states publisher and /joint_command -> Articulation
-#    Controller graph stay as they are -- this node still uses those same
-#    topic names.
-#
-# 4. You can remove/disable the Isaac Compute Odometry Node + ROS2 Publish
-#    Odometry graph from before -- this node no longer uses /odom at all.
-#
-# 5. CRITICAL, per NVIDIA's own docs: start this node BEFORE hitting Play,
-#    not after. e.g.:
-#      conda activate h2_rl && source /opt/ros/jazzy/setup.bash
-#      python3 h2_fullbody_controller.py
-#    ...THEN press Play in Isaac Sim. This node will just sit idle waiting
-#    for the first synchronized joint_states/imu message pair, so there's
-#    no harm in it running before physics starts -- but starting Play first
-#    (our old order) left the robot with no active balancing policy for the
-#    first several seconds, which is very likely why the settle-phase saga
-#    was ever necessary in the first place.
+# 1. IMU sensor on the pelvis + ActionGraph "ROS_Imu" (On Physics Step ->
+#    Isaac Read IMU (Read Gravity unchecked) -> ROS2 Publish IMU "imu",
+#    with Isaac Read Simulation Time, Reset on Stop checked).
+# 2. Existing /joint_states publisher and /joint_command -> Articulation
+#    Controller graphs unchanged.
+# 3. Start this node BEFORE pressing Play.
+# 4. Head override: the camera TF (pelvis <- Camera) must come from a TF
+#    tree that includes head_pitch_joint (Isaac TF publisher or
+#    robot_state_publisher on /joint_states), NOT a static transform —
+#    otherwise the navigator's box estimate will be wrong once the head tilts.
 # ============================================================================

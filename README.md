@@ -110,8 +110,7 @@ FoundationPose pipeline: see `docker/README.md` (runs inside the container).
 - `models/h2_balance_box_pickup/` - balance policy (`policy.pt`) + `policy_io.json`
   (joint order, gains, obs layout) loaded by `H2_balance_controller.py` and
   `H2_pickup_sequencer.py`
-- `models/h2_walking/` - locomotion policy for `h2_fullbody_controller.py`, not
-  committed; see `models/README.md`
+- `models/h2_walking/` - locomotion policy for `h2_fullbody_controller.py`
 - FoundationPose weights are not committed; download from NVIDIA NGC into the
   container workspace (see `docker/README.md`)
 
