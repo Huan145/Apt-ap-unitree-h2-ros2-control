@@ -21,14 +21,22 @@ Coordinate frames:
   Pelvis frame : x=forward, y=left,  z=up
   Box frame    : defined by FoundationPose mesh origin
 
+Targets (targets.yaml, switched at runtime by /active_target):
+  mode grasp : box -> /target_pose_left, /target_pose_right (as described above)
+  mode pose  : e.g. workstation -> /workstation_pose = object pose in the pelvis frame, stamped with
+               the detection's image time and published only when a new detection arrives
+Detections whose bbox does not match the active target's `size` are ignored (stale output after a switch).
+
 Subscribes:
   /tracking/output  - vision_msgs/Detection3DArray
   /rgb              - sensor_msgs/Image
   /camera_info      - sensor_msgs/CameraInfo
+  /active_target    - std_msgs/String (key of targets.yaml)
 Publishes:
   /tracking_visualization - sensor_msgs/Image
-  /target_pose_left       - geometry_msgs/PoseStamped (pelvis frame)
-  /target_pose_right      - geometry_msgs/PoseStamped (pelvis frame)
+  /target_pose_left       - geometry_msgs/PoseStamped (pelvis frame, grasp mode)
+  /target_pose_right      - geometry_msgs/PoseStamped (pelvis frame, grasp mode)
+  /workstation_pose       - geometry_msgs/PoseStamped (pelvis frame, pose mode)
 """
 
 import rclpy
@@ -36,10 +44,13 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from vision_msgs.msg import Detection3DArray
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
 import tf2_ros
 import numpy as np
 import cv2
 import time
+
+from targets import load_targets, size_matches
 
 AXIS_LENGTH  = 0.12
 GRASP_REACH  = 0.05   # metres outside the box Y face
@@ -220,7 +231,7 @@ def compute_grasp_quaternions(R_box_cam, T_pelvis_cam):
 
 # ── Overlay drawing ───────────────────────────────────────────────────────────
 
-def draw_overlay(img_bgr, pose, box_size, fx, fy, cx, cy):
+def draw_overlay(img_bgr, pose, box_size, fx, fy, cx, cy, grasp=True):
     p = pose.position
     q = pose.orientation
     R = quat_to_rot((q.x, q.y, q.z, q.w))
@@ -262,6 +273,9 @@ def draw_overlay(img_bgr, pose, box_size, fx, fy, cx, cy):
                 f"cam: fx={fx:.1f} cx={cx:.1f} cy={cy:.1f}",
                 (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150,150,150), 1)
 
+    if not grasp:
+        return img_bgr, None, None, R
+
     # Grasp points in object frame (on the box ±Y faces, standoff = GRASP_REACH)
     g1_obj = np.array([0.0,  hy + GRASP_REACH, 0.0])
     g2_obj = np.array([0.0, -(hy + GRASP_REACH), 0.0])
@@ -300,6 +314,10 @@ class PoseOverlayVisualizerTracking(Node):
     def __init__(self):
         super().__init__('pose_overlay_visualizer_tracking')
 
+        self.declare_parameter('targets_file', '')
+        self.declare_parameter('target', 'klt_box')   # initial target, /active_target overrides
+        self.targets = load_targets(self.get_parameter('targets_file').value or None)
+
         self.latest_pose       = None
         self.latest_stamp      = None   # image time of the detection (TF is looked up at this time)
         self.latest_box_size   = None
@@ -320,22 +338,55 @@ class PoseOverlayVisualizerTracking(Node):
             Image, '/rgb', self.rgb_callback, 10)
         self.create_subscription(
             CameraInfo, '/camera_info', self.camera_info_callback, 10)
+        self.create_subscription(
+            String, '/active_target', self.target_callback, 10)
 
         self.pub_vis   = self.create_publisher(Image,       '/tracking_visualization', 10)
         self.pub_left  = self.create_publisher(PoseStamped, '/target_pose_left',       10)
         self.pub_right = self.create_publisher(PoseStamped, '/target_pose_right',      10)
+        self.pub_obj   = self.create_publisher(PoseStamped, '/workstation_pose',       10)
+
+        if not self.set_target(self.get_parameter('target').value):
+            raise SystemExit(f'unknown initial target; known: {list(self.targets)}')
 
         self.get_logger().info(
             'PoseOverlayVisualizerTracking ready.\n'
             f'  TF chain     : {CAMERA_FRAME} → {PELVIS_FRAME}\n'
-            '  Subscribing  : /tracking/output  /rgb  /camera_info\n'
+            '  Subscribing  : /tracking/output  /rgb  /camera_info  /active_target\n'
             '  Publishing   : /tracking_visualization  '
-            '/target_pose_left  /target_pose_right\n'
+            '/target_pose_left  /target_pose_right  /workstation_pose\n'
             '  Grasp orient : hand Y axis aligned with box face normal\n'
             '    Left  (G1) : hand Y → -box_Y_pelvis\n'
             '    Right (G2) : hand Y → +box_Y_pelvis\n'
             '  Intrinsics   : waiting for /camera_info...'
         )
+
+    def target_callback(self, msg: String):
+        if msg.data != self.target:      # the orchestrator republishes at ~1 Hz
+            self.set_target(msg.data)
+
+    def set_target(self, name):
+        if name not in self.targets:
+            self.get_logger().error(f'Unknown target "{name}" (known: {list(self.targets)})',
+                                    throttle_duration_sec=5.0)
+            return False
+        self.target, self.cfg = name, self.targets[name]
+        self.latest_pose = self.latest_box_size = self.latest_stamp = None   # drop the old target's pose
+        self.get_logger().info(f'Active target: {name} (mode={self.cfg["mode"]})')
+        if self.cfg.get('size') is None:
+            self.get_logger().warn(f'"{name}" has no size in targets.yaml - stale detections '
+                                   'after a switch are not filtered (see check_mesh.py)')
+        return True
+
+    def _publish_object_pose(self):
+        """pose mode: object pose in the pelvis frame at the detection's image time."""
+        T = self._get_T_pelvis_cam(self.latest_stamp)
+        if T is None:
+            return
+        p, q = self.latest_pose.position, self.latest_pose.orientation
+        R = T[:3, :3] @ quat_to_rot((q.x, q.y, q.z, q.w))
+        self.pub_obj.publish(self._make_pose_stamped(
+            cam_to_pelvis(np.array([p.x, p.y, p.z]), T), rot_to_quat(R), self.latest_stamp))
 
     def _get_T_pelvis_cam(self, stamp=None):
         """Camera pose in the pelvis frame at `stamp` (the image the box pose came
@@ -392,6 +443,12 @@ class PoseOverlayVisualizerTracking(Node):
     def pose_callback(self, msg: Detection3DArray):
         if msg.detections:
             det                  = msg.detections[0]
+            if not size_matches(det.bbox.size, self.cfg.get('size')):
+                s = det.bbox.size
+                self.get_logger().warn(
+                    f'Ignoring detection with bbox {s.x:.2f}x{s.y:.2f}x{s.z:.2f}m: not "{self.target}" '
+                    f'{self.cfg["size"]} (stale output after a switch?)', throttle_duration_sec=2.0)
+                return
             self.latest_pose     = det.results[0].pose.pose
             self.latest_box_size = det.bbox.size
             self.latest_stamp    = msg.header.stamp
@@ -402,6 +459,8 @@ class PoseOverlayVisualizerTracking(Node):
                 f'box=({s.x:.3f}×{s.y:.3f}×{s.z:.3f})m',
                 throttle_duration_sec=1.0,
             )
+            if self.cfg['mode'] == 'pose':
+                self._publish_object_pose()
 
     def rgb_callback(self, msg: Image):
         now = time.time()
@@ -421,9 +480,13 @@ class PoseOverlayVisualizerTracking(Node):
             return
 
         if self.latest_pose is not None and self.latest_box_size is not None:
+            grasp = self.cfg['mode'] == 'grasp'
             img_bgr, g1_cam, g2_cam, R_box_cam = draw_overlay(
                 img_bgr, self.latest_pose, self.latest_box_size,
-                self.fx, self.fy, self.cx, self.cy)
+                self.fx, self.fy, self.cx, self.cy, grasp)
+            if not grasp:                # pose mode publishes from pose_callback
+                self._publish_image(img_bgr, msg)
+                return
 
             T_pelvis_cam = self._get_T_pelvis_cam(self.latest_stamp)
             if T_pelvis_cam is not None:
@@ -486,7 +549,7 @@ class PoseOverlayVisualizerTracking(Node):
                     throttle_duration_sec=2.0,
                 )
         else:
-            cv2.putText(img_bgr, 'Waiting for tracking pose...',
+            cv2.putText(img_bgr, f'Waiting for {self.target} pose...',
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (0, 255, 255), 2)
 

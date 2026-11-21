@@ -1,0 +1,27 @@
+# FoundationPose targets. The orchestrator publishes one key on /active_target (std_msgs/String, ~1 Hz).
+#
+#   label           Isaac Sim semantic label                                -> semantic_mask_node
+#   mode            grasp: box -> /target_pose_left,right                  -> pose_overlay_visualizer
+#                   pose : object pose in the pelvis frame -> /workstation_pose
+#   size            expected bbox [x, y, z] m. Detections of another size are dropped
+#                   (stale output right after a switch). null = no filtering. Get it from check_mesh.py
+#   foundationpose  parameters set on the running FoundationPose node  -> target_switcher (apt2)
+#                   switchable at runtime: mesh_file_path, symmetry_axes, symmetry_planes,
+#                   fixed_translations, fixed_axis_angles, rot_normalizer, score_crop_ratio
+#                   (floats need a decimal point; no symmetry = [''] , the node default)
+
+klt_box:
+  label: klt_box
+  mode: grasp
+  size: [0.30, 0.48, 0.15]
+  foundationpose:
+    mesh_file_path: /workspaces/isaac_ros-dev/KLT_box/KLT_box_metres.obj
+    symmetry_axes: ['']
+
+workstation:
+  label: workstation
+  mode: pose
+  size: [0.762, 2.474, 1.050]                  # check_mesh.py ws.obj --scale 1 1 1.05626 --recentre (long side = Y)
+  foundationpose:
+    mesh_file_path: /workspaces/isaac_ros-dev/workstation/workstation_metres.obj
+    symmetry_axes: ['']                        # detailed asset: none. Add z_180 only if the pose flips 180° about z
