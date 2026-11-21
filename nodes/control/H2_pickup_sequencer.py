@@ -21,10 +21,12 @@ not on a timer:
               deep and the box twists the soft wrists (hand slants): 5 cm was too much
   4 tilt      joint space, one move: *_wrist_pitch_joint += --tilt-wrist (-9 deg)
               (+ *_elbow_joint += --tilt-elbow, default 0)
-  5 carry     both hands shifted together so the grip midpoint goes to CARRY_CENTER (grip width
-              kept); hands held --carry-pitch (9 deg, same direction as the tilt) from the GROUND,
-              using the pelvis IMU (pelvis lean is compensated)
-  6 hold      the carry pose; re-levels the hands when the pelvis tilts > LEVEL_KEEP_DEG
+  5 carry     to CARRY_POSE, the box-holding arm angles saved in H2_box.usd (hands welded to the
+              0.48 m box): both hands go to the hand poses of CARRY_POSE, spread to the CURRENT grip
+              width about that pose's midpoint, along a straight Cartesian path (CARRY_STEPS IK
+              knots) so the grip width holds the whole way. Same box width -> exactly CARRY_POSE.
+              The training arm motion ends on the same pose (h2_balance mdp/commands.py).
+  6 hold      the carry pose
 
 "Outside / inward" = along the horizontal line between the two targets, so the
 targets' orientation convention does not matter. The target is the grasp
@@ -108,9 +110,20 @@ MIN_MOVE_S = 0.5
 # wide: --wide-out / --wide-up (default 15 / 15 cm) outside / above the standoff, at the target's x
 #       (hands pulled back beside the body put the arm mass behind the robot -> it fell backwards)
 GRASP_REACH_M = 0.05                   # the target is this far outside the box face (visualizer GRASP_REACH)
-LEVEL_KEEP_DEG = 3.0                   # hold: re-level the hands when the pelvis tilted more than this
 ELBOW_IDX, WRIST_PITCH_IDX = 3, 5      # index in each arm's 7 joints (see LEFT_ARM_NAMES)
-CARRY_CENTER = np.array([0.20, 0.0, 0.275])
+# Carry pose: arm joint states saved in H2_box.usd (hands welded to the 0.48 m box). Shoulder pitch ~0
+# (upper arm down), roll +-17 deg (around the box), elbow 0 (= forearm forward on the H2), wrist roll
+# -+14 deg (hands face the box sides).
+CARRY_POSE_DICT = {
+    "left_shoulder_pitch_joint": 0.00067, "right_shoulder_pitch_joint": 0.00243,
+    "left_shoulder_roll_joint": 0.29404, "right_shoulder_roll_joint": -0.29053,
+    "left_shoulder_yaw_joint": -0.00051, "right_shoulder_yaw_joint": 0.00052,
+    "left_elbow_joint": 0.00068, "right_elbow_joint": 0.00059,
+    "left_wrist_roll_joint": -0.24446, "right_wrist_roll_joint": 0.26193,
+    "left_wrist_pitch_joint": -0.00027, "right_wrist_pitch_joint": -0.00063,
+    "left_wrist_yaw_joint": 0.05243, "right_wrist_yaw_joint": -0.05767,
+}
+CARRY_STEPS = 10          # IK knots on the carry path
 # Phase machine
 PHASES = ["wide", "standoff", "pinch", "tilt", "carry", "hold"]
 LIVE = {"standoff"}                       # replanned (after the current move) when the target moved
@@ -160,6 +173,7 @@ class Arm:
         self.t0 = None                     # move start time (None = start on the next tick)
         self.dur = 0.0
         self.goal = None                   # (pos, rot) of the current move
+        self.knots = None                  # (n, 7) joint path of the current move (carry), else None
         self.planned_for = None            # target (pos, rot) the current move was planned from
         self.busy = False                  # IK thread running
         self.failed = False                # last IK rejected
@@ -177,7 +191,6 @@ class PickupSequencer(Node):
                      for s, names, ee, sign in [("L", LEFT_ARM_NAMES, "left_hand_link", 1.0),
                                                 ("R", RIGHT_ARM_NAMES, "right_hand_link", -1.0)]]
         self.joint_state = None
-        self.imu = None                    # latest /imu paired with /joint_states (--clock stamp)
         self.targets = {"L": None, "R": None}
         self.phase = 0
         self.started = self.done = False
@@ -189,7 +202,7 @@ class PickupSequencer(Node):
             self._sync_subs = [Subscriber(self, JointState, "/joint_states", qos_profile=SIM_QOS),
                                Subscriber(self, Imu, args.imu_topic, qos_profile=SIM_QOS)]
             self._sync = TimeSynchronizer(self._sync_subs, 10)
-            self._sync.registerCallback(lambda js, imu: self.cb_joint_states(js, imu))
+            self._sync.registerCallback(lambda js, imu: self.cb_joint_states(js))
         else:
             self.create_subscription(JointState, "/joint_states", self.cb_joint_states, SIM_QOS)
         self.create_subscription(PoseStamped, "/target_pose_left", lambda m: self.cb_target("L", m), 10)
@@ -232,10 +245,8 @@ class PickupSequencer(Node):
                                           ("/target_pose_right", self.targets["R"])] if v is None]
                 raise RuntimeError(f"Timed out waiting for {missing} (ROS_DOMAIN_ID? sim playing?)")
 
-    def cb_joint_states(self, msg, imu=None):
+    def cb_joint_states(self, msg):
         self.joint_state = msg
-        if imu is not None:
-            self.imu = imu
         if not self.started or self.a.clock != "stamp" or self.done:
             return
         t = stamp_s(msg)
@@ -309,33 +320,35 @@ class PickupSequencer(Node):
             p[2] = (self.targets["L"][0][2] + self.targets["R"][0][2]) / 2
         return p
 
-    def pelvis_tilt(self):
-        """Pelvis roll/pitch as a rotation: pelvis frame relative to its yaw-only (level) frame, from the
-        IMU orientation. Identity without an IMU (--clock wall)."""
-        if self.imu is None:
-            return np.eye(3)
-        o = self.imu.orientation
-        R = Rotation.from_quat([o.x, o.y, o.z, o.w]).as_matrix()
-        return Rotation.from_euler("z", -np.arctan2(R[1, 0], R[0, 0])).as_matrix() @ R
+    def carry_target(self, data, q, arm):
+        """Hand pose at CARRY_POSE, spread to the current grip width about that pose's midpoint."""
+        qp = q.copy()
+        for a in self.arms:
+            qp[a.q_idx] = [CARRY_POSE_DICT[n] for n in a.names]
+        (pl, Rl), (pr, Rr) = self.fk(data, qp, self.arms[0].ee), self.fk(data, qp, self.arms[1].ee)
+        w = np.linalg.norm(self.fk(data, q, self.arms[0].ee)[0] - self.fk(data, q, self.arms[1].ee)[0])
+        u = (pl - pr) / np.linalg.norm(pl - pr)
+        self.log(f"{arm.side} carry: grip width {w * 100:.1f} cm (CARRY_POSE: {np.linalg.norm(pl - pr) * 100:.1f} cm)")
+        return (pl + pr) / 2 + arm.sign * w / 2 * u, (Rl if arm.side == "L" else Rr), qp[arm.q_idx]
 
-    def carry_rot(self, arm, R_ref):
-        """Hand orientation (pelvis frame) pitched --carry-pitch from the ground, fingers forward, in the
-        pitch direction of R_ref (the post-tilt hand). Remembers the pelvis tilt it was computed for."""
-        s = np.sign(Rotation.from_matrix(R_ref).as_euler("xyz")[1]) or -1.0
-        arm.level_used = self.pelvis_tilt()
-        return arm.level_used.T @ Rotation.from_euler("y", s * self.a.carry_pitch, degrees=True).as_matrix()
-
-    def relevel_hold(self, now):
-        """Hold: re-plan an idle arm when the pelvis tilted > LEVEL_KEEP_DEG since its last plan."""
-        if self.name != "hold" or self.imu is None:
-            return
-        for arm in self.arms:
-            idle = not arm.busy and arm.q_to is not None and arm.t0 is not None and now - arm.t0 >= arm.dur
-            if idle and getattr(arm, "level_used", None) is not None:
-                d = np.degrees(np.linalg.norm(pin.log3(arm.level_used.T @ self.pelvis_tilt())))
-                if d > LEVEL_KEEP_DEG:
-                    self.log(f"{arm.side} pelvis tilted {d:.1f} deg -> re-level hands")
-                    self.start_plan(arm)
+    def carry_path(self, data, arm, q):
+        """Straight Cartesian line (orientation slerped) to carry_target, IK at CARRY_STEPS knots, each
+        seeded on the joint-space line to CARRY_POSE (keeps the path continuous, ends at CARRY_POSE when
+        the grip width matches). Returns (ik result of the last knot, as ik(), pos, rot, knots (n+1, 7))."""
+        pos, rot, q_pose = self.carry_target(data, q, arm)
+        q0 = q[arm.q_idx].copy()
+        p0, R0 = self.fk(data, q, arm.ee)
+        slerp = Slerp([0, 1], Rotation.from_matrix(np.stack([R0, rot])))
+        knots = [q0]
+        for k in range(1, CARRY_STEPS + 1):
+            f = k / CARRY_STEPS
+            qs = q.copy()
+            qs[arm.q_idx] = q0 + f * (q_pose - q0)
+            res = self.ik(data, arm, qs, p0 + f * (pos - p0), slerp(f).as_matrix())
+            if res is None or res == "reject":
+                return res, pos, rot, None
+            knots.append(res[0])
+        return res, pos, rot, np.array(knots)
 
     def out_dir(self):
         """Unit vector right target -> left target, horizontal."""
@@ -413,15 +426,11 @@ class PickupSequencer(Node):
     def plan(self, arm, name, q, goal):
         """IK thread (like H2_ik_node): solve, then hand the result to tick() via commit()."""
         data = self.model.createData()
-        if name == "carry":     # shift both hands by the same offset (grip width kept), hands pitched from the ground
-            mid = np.mean([self.fk(data, q, a.ee)[0] for a in self.arms], axis=0)
-            p_now, R_now = self.fk(data, q, arm.ee)
-            pos, rot = p_now + CARRY_CENTER - mid, self.carry_rot(arm, R_now)
-        elif name == "hold":    # re-level: same position, orientation re-expressed for the current pelvis tilt
-            pos, rot = arm.goal[0], self.carry_rot(arm, arm.goal[1])
+        if name == "carry":
+            res, pos, rot, knots = self.carry_path(data, arm, q)
         else:
-            pos, rot = goal
-        res = self.ik(data, arm, q, pos, rot)
+            (pos, rot), knots = goal, None
+            res = self.ik(data, arm, q, pos, rot)
         if res is None or arm.cancel.is_set():
             return
         if res == "reject":
@@ -430,16 +439,22 @@ class PickupSequencer(Node):
             arm.failed, arm.busy, arm.rejected_for, arm.planned_for = True, False, arm.planned_for, None
             return
         q_arm, e_pos, e_rot = res
-        self.commit(arm, q_arm, (pos, rot), self.a.pinch_time if name == "pinch" else MIN_MOVE_S)
+        self.commit(arm, q_arm, (pos, rot), self.a.pinch_time if name == "pinch" else MIN_MOVE_S, knots)
+        if name == "carry":
+            pose = np.array([CARRY_POSE_DICT[n] for n in arm.names])
+            self.log(f"{arm.side} carry: ends max {np.degrees(np.abs(q_arm - pose)).max():.1f} deg from CARRY_POSE")
         bad = e_pos > IK_WARN_MM or e_rot > IK_WARN_DEG
         self.log(f"{arm.side} {name}: IK {e_pos:.1f} mm" + (f" / {e_rot:.1f} deg" if rot is not None else " (orientation free)")
                  + f", move {arm.dur:.2f}s -> {pos.round(3)}"
                  + (" - IK could not fully reach this pose (limits?)" if bad else ""), warn=bad)
 
-    def commit(self, arm, q_to, goal, min_s=MIN_MOVE_S):
+    def commit(self, arm, q_to, goal, min_s=MIN_MOVE_S, knots=None):
+        """Start a joint move to q_to: straight in joint space, or through `knots` (first = start)."""
         with arm.lock:
             arm.q_from, arm.q_to, arm.goal = arm.q_cmd.copy(), q_to, goal
-            arm.dur = max(np.degrees(np.max(np.abs(q_to - arm.q_from))) / self.a.max_vel, min_s)
+            arm.knots = None if knots is None else np.vstack([arm.q_from, knots[1:]])
+            path = np.vstack([arm.q_from, q_to]) if knots is None else arm.knots
+            arm.dur = max(np.degrees(np.abs(np.diff(path, axis=0)).sum(axis=0).max()) / self.a.max_vel, min_s)
             arm.t0, arm.busy, arm.failed = None, False, False
 
     # ── 50 Hz tick ──────────────────────────────────────────────────────────
@@ -481,7 +496,13 @@ class PickupSequencer(Node):
                     if arm.t0 is None:
                         arm.t0 = now
                     s = min((now - arm.t0) / arm.dur, 1.0)
-                    arm.q_cmd = arm.q_from + s * s * (3 - 2 * s) * (arm.q_to - arm.q_from)
+                    s = s * s * (3 - 2 * s)
+                    if arm.knots is None:
+                        arm.q_cmd = arm.q_from + s * (arm.q_to - arm.q_from)
+                    else:     # piecewise linear through the knots, smoothstep timing over the whole path
+                        x = s * (len(arm.knots) - 1)
+                        k = min(int(x), len(arm.knots) - 2)
+                        arm.q_cmd = arm.knots[k] + (x - k) * (arm.knots[k + 1] - arm.knots[k])
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = ARM_JOINT_NAMES
@@ -490,7 +511,6 @@ class PickupSequencer(Node):
         self.flag_pub.publish(Bool(data=self.phase >= PHASES.index("carry")))
         self.step_phase(now)
         self.replan_moved_targets(now)
-        self.relevel_hold(now)
 
     def load_factor(self):
         """0 before carry, then ramps 0 -> 1 over LOAD_RAMP_S: share of the box weight compensated."""
@@ -601,7 +621,6 @@ def main():
     p.add_argument("--settle", type=float, default=0.5, help="pinch: hold the squeeze this long before tilt + lift (s)")
     p.add_argument("--squeeze", type=float, default=0.03, help="pinch: command this far past the box face (m) = grip force")
     p.add_argument("--pinch-time", type=float, default=1.0, help="pinch: minimum duration of the close-in move (s)")
-    p.add_argument("--carry-pitch", type=float, default=9.0, help="carry/hold: hand pitch from the ground (deg)")
     p.add_argument("--replan-mm", type=float, default=10.0, help="replan when a target moves more than this")
     p.add_argument("--replan-deg", type=float, default=3.0, help="... or rotates more than this")
     p.add_argument("--wide", type=float, nargs=3, default=[0.1, 0.40, 0.25], metavar=("X", "Y", "Z"),

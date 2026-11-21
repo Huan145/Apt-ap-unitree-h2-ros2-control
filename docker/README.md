@@ -61,7 +61,11 @@ Key points:
 To reattach to a running container:
 
     docker exec -it isaac_ros_fp bash
+    
+Or to start the container:
 
+    docker start -ai isaac_ros_fp
+    
 ## Launching the pipeline
 
 Inside the container:

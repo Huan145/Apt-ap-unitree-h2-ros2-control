@@ -24,9 +24,22 @@ sequencer's first /arm_targets message. Optional: --ramp/--hold ease all
 joints into the default pose first (off by default); arm targets that arrive
 before "Policy active" are ignored.
 
+HEAD PITCH OVERRIDE (same behaviour as h2_fullbody_controller.py):
+  - std_msgs/Float64 on /head_pitch_cmd (radians, joint angle). While commands
+    arrive, head_pitch_joint follows them at --head-rate rad/s, clamped to
+    [--head-min, --head-max], starting from the MEASURED head angle (no jump).
+  - Written back into the action vector, so the policy's last-action observation
+    matches what was really commanded.
+  - Release: send NaN or stop publishing for --head-timeout s -> the head slews
+    back to its training default and the policy takes the head again.
+  Use: lower the head to the box-locomotion default (0.0) BEFORE handing over to
+  h2_fullbody_box_controller.py, e.g.
+    ros2 topic pub -r 20 /head_pitch_cmd std_msgs/msg/Float64 "{data: 0.0}"
+
 Subscribes: /joint_states (JointState), /imu (sensor_msgs/Imu, pelvis-mounted),
             /arm_targets (JointState, 14 arm joints),
-            /load_expected (std_msgs/Bool, from the sequencer; False until received)
+            /load_expected (std_msgs/Bool, from the sequencer; False until received),
+            /head_pitch_cmd (std_msgs/Float64, optional head override)
 Publishes:  /joint_command (JointState, 31 joints, radians)
 
 Usage:
@@ -37,6 +50,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import time
 
@@ -48,7 +62,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Imu, JointState
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float64
 
 # Same as h2_fullbody_controller.py (proven with this sim): reliable, keep every message
 SIM_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE,
@@ -57,6 +71,7 @@ SIM_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=Durabili
 STALE_S = 0.1        # --clock wall: stop commanding if joint_states/imu are older than this (wall time)
 IMU_MAX_LAG_S = 0.02  # --clock stamp: skip a step if IMU and joint_states stamps are further apart (sim time)
 START_TOL = 0.1       # rad; warn if a joint starts further than this from the training start pose
+HEAD_PITCH_JOINT = "head_pitch_joint"
 
 # <repo>/nodes/control/this_file.py -> <repo>/models/h2_balance_box_pickup/
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -69,7 +84,8 @@ def stamp_s(msg):
 
 class BalanceController(Node):
     def __init__(self, policy_path, io_path, cmd_topic, arm_topic, imu_topic, ramp_s=0.0, hold_s=0.0,
-                 clock="stamp"):
+                 clock="stamp", head_topic="/head_pitch_cmd", head_min=-0.5, head_max=0.7,
+                 head_rate=0.5, head_timeout=1.0):
         super().__init__("h2_balance_controller")
         self.ramp_s, self.hold_s, self.clock = ramp_s, hold_s, clock
         self.startup_q = self.startup_t0 = None
@@ -116,6 +132,19 @@ class BalanceController(Node):
         self.last_stamp, self.same_stamp_count = None, 0
         self.arm_idx = [self.joint_names.index(j) for j in self.arm_names]
 
+        # --- head override ---
+        self.head_min, self.head_max = float(head_min), float(head_max)
+        self.head_rate, self.head_timeout = float(head_rate), float(head_timeout)
+        self.head_act_i = self.act_names.index(HEAD_PITCH_JOINT) if HEAD_PITCH_JOINT in self.act_names else None
+        self.head_q_i = self.joint_names.index(HEAD_PITCH_JOINT)
+        self.head_override = False      # True while we own head_pitch_joint
+        self.head_need_init = False     # engaged, start angle not taken yet
+        self.head_target = None         # latest requested angle (None = release)
+        self.head_cur = 0.0             # angle currently commanded by the override
+        self.head_last_t = None         # control-clock time of the last valid command
+        self.head_released_logged = False
+        self.now = None                 # control-clock time of the latest control step
+
         if clock == "stamp":
             # joint_states + IMU paired by identical stamp (one pair per physics step), like h2_fullbody_controller
             self._sync_subs = [Subscriber(self, JointState, "/joint_states", qos_profile=SIM_QOS),
@@ -128,13 +157,19 @@ class BalanceController(Node):
             self.create_timer(1.0 / self.hz, self.tick)
         self.create_subscription(JointState, arm_topic, self.cb_arm, 10)
         self.create_subscription(Bool, "/load_expected", self.cb_flag, 10)
+        if self.head_act_i is None:
+            self.get_logger().warn(f"{HEAD_PITCH_JOINT} is not a policy joint - head override disabled")
+        else:
+            self.create_subscription(Float64, head_topic, self.cb_head, 10)
         self.pub = self.create_publisher(JointState, cmd_topic, SIM_QOS)
 
         self.get_logger().info(
             f"Policy {policy_path} | obs {self.obs_dim} = " + " + ".join(f"{n}({d})" for n, d in self.obs_terms)
             + f" | {len(self.act_names)} policy joints + {len(self.arm_names)} arm joints @ {self.hz:.0f} Hz "
             + ("of /joint_states stamp time (sim time in Isaac Sim)" if clock == "stamp" else "wall clock")
-            + f" -> {cmd_topic}")
+            + f" -> {cmd_topic}"
+            + (f" | head override on {head_topic} [{self.head_min:+.2f},{self.head_max:+.2f}] rad, "
+               f"{self.head_rate} rad/s, timeout {self.head_timeout}s" if self.head_act_i is not None else ""))
 
     # ── Inputs ──────────────────────────────────────────────────────────────
 
@@ -167,6 +202,48 @@ class BalanceController(Node):
         if msg.data and not self.load_expected:
             self.get_logger().info("load_expected -> True")
         self.load_expected = float(msg.data)
+
+    def cb_head(self, msg):
+        v = float(msg.data)
+        if not math.isfinite(v):                       # explicit release
+            if self.head_override and self.head_target is not None:
+                self.get_logger().info("[HEAD] release requested -> returning to default")
+            self.head_target = None
+            return
+        self.head_target = float(np.clip(v, self.head_min, self.head_max))
+        self.head_last_t = self._clock_now()
+        self.head_released_logged = False
+        if not self.head_override:
+            self.head_override, self.head_need_init = True, True
+            self.get_logger().info(f"[HEAD] override engaged toward {self.head_target:+.3f} rad")
+
+    def _clock_now(self):
+        """Time on the control clock: latest /joint_states stamp (--clock stamp) or wall time."""
+        if self.clock == "stamp":
+            return self.last_stamp if self.last_stamp is not None else 0.0
+        return time.monotonic()
+
+    def update_head(self, now):
+        """Advance the override by one control step; head angle to command, or None (policy owns it)."""
+        if not self.head_override or not self.policy_active:
+            return None
+        if self.head_need_init:                        # start from where the head IS
+            self.head_cur = float(self.q[self.head_q_i])
+            self.head_need_init = False
+            self.get_logger().info(f"[HEAD] starting from measured {self.head_cur:+.3f} rad")
+        default = float(self.default_pos[self.head_q_i])
+        stale = self.head_target is None or self.head_last_t is None or now - self.head_last_t > self.head_timeout
+        if stale and not self.head_released_logged:
+            self.get_logger().info("[HEAD] no command (timeout/release) -> slewing to default")
+            self.head_released_logged = True
+        goal = default if stale else self.head_target
+        step = self.head_rate * self.step_dt
+        self.head_cur += float(np.clip(goal - self.head_cur, -step, step))
+        if stale and abs(self.head_cur - default) < 1e-3:
+            self.head_override, self.head_target = False, None
+            self.get_logger().info("[HEAD] override released -> policy controls head")
+            return None
+        return self.head_cur
 
     def cb_arm(self, msg):
         if not self.policy_active:
@@ -228,6 +305,12 @@ class BalanceController(Node):
         obs = np.concatenate([np.asarray(f(), dtype=np.float32).ravel() for _, _, f in self.builders])
         with torch.no_grad():
             action = self.policy(torch.from_numpy(obs)[None])[0].numpy().astype(np.float64)
+        head = self.update_head(now)
+        if head is not None:
+            # express the override in action space: offset + scale * action == head,
+            # so last_action (an observation) matches what is really commanded
+            i = self.head_act_i
+            action[i] = (head - self.act_offset[i]) / self.act_scale[i]
         self.last_action = action
         self.publish(self.act_names + self.arm_names,
                      np.concatenate([self.act_offset + self.act_scale * action, self.arm_target]))
@@ -240,6 +323,7 @@ class BalanceController(Node):
         self.last_action[:] = 0.0
         self.arm_target = None
         self.load_expected = 0.0
+        self.head_override, self.head_need_init, self.head_target, self.head_last_t = False, False, None, None
 
     def check_start_pose(self):
         """One-time warning if the robot doesn't start where every training episode did."""
@@ -293,6 +377,12 @@ def main():
     p.add_argument("--clock", choices=["stamp", "wall"], default="stamp",
                    help="stamp (default): step on /joint_states header time = sim time in Isaac Sim, correct at any "
                         "real-time factor; wall: fixed wall-clock timer")
+    p.add_argument("--head-topic", default="/head_pitch_cmd", help="std_msgs/Float64 head pitch override (rad)")
+    p.add_argument("--head-min", type=float, default=-0.5, help="head override lower clamp (rad) - check URDF limits")
+    p.add_argument("--head-max", type=float, default=0.7, help="head override upper clamp (rad) - check URDF limits")
+    p.add_argument("--head-rate", type=float, default=0.5, help="head override slew rate (rad/s)")
+    p.add_argument("--head-timeout", type=float, default=1.0,
+                   help="release the head override after this long without a command (s, control clock)")
     args = p.parse_args()
     for path in (args.policy, args.io):
         if not os.path.isfile(path):
@@ -300,7 +390,9 @@ def main():
 
     rclpy.init()
     node = BalanceController(args.policy, args.io, args.cmd_topic, args.arm_topic, args.imu_topic,
-                             ramp_s=args.ramp, hold_s=args.hold, clock=args.clock)
+                             ramp_s=args.ramp, hold_s=args.hold, clock=args.clock,
+                             head_topic=args.head_topic, head_min=args.head_min, head_max=args.head_max,
+                             head_rate=args.head_rate, head_timeout=args.head_timeout)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
