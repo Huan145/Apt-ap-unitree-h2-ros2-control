@@ -59,7 +59,7 @@ def test_switch_sets_the_targets_parameters_once(sw):
     assert len(sw.cli.calls) == 1
     p = params(sw.cli.calls[0])
     assert p == load_targets()['workstation']['foundationpose']       # exactly what the registry says
-    assert p['mesh_file_path'].endswith('workstation_metres.obj')
+    assert p['mesh_file_path'].endswith('workstation_one.obj')
     sw.subs['/active_target'](string('workstation'))            # busy: the 1 Hz republish is ignored
     assert len(sw.cli.calls) == 1
     sw.cli.calls[0][1].resolve((True, ''), (True, ''))

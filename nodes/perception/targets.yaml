@@ -21,7 +21,7 @@ klt_box:
 workstation:
   label: workstation
   mode: pose
-  size: [0.762, 2.474, 1.050]                  # check_mesh.py ws.obj --scale 1 1 1.05626 --recentre (long side = Y)
+  size: [0.762, 2.474, 1.050]                  # check_mesh.py ws.obj --scale 1 1 1.05626 --recentre --flatten (long side = Y)
   foundationpose:
-    mesh_file_path: /workspaces/isaac_ros-dev/workstation/workstation_metres.obj
+    mesh_file_path: /workspaces/isaac_ros-dev/workstation/workstation_one.obj   # ONE part: FoundationPose reads only the first
     symmetry_axes: ['']                        # detailed asset: none. Add z_180 only if the pose flips 180° about z

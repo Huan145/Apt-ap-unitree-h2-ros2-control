@@ -133,6 +133,42 @@ def test_size_gate_drops_stale_detections_after_a_switch(node):
     assert node.latest_pose is not None and len(msgs(node, '/workstation_pose')) == 1
 
 
+def nan_det(size, position=True, orientation=True):
+    """What FoundationPose publishes while it re-estimates: NaN pose (both parts), normal bbox."""
+    m = det_msg(np.eye(3), (np.nan if position else 1.0,) * 3, size)
+    o = m.detections[0].results[0].pose.pose.orientation
+    if orientation:
+        o.x = o.y = o.z = o.w = float('nan')
+    return m
+
+
+@pytest.mark.parametrize('position, orientation', [(True, True), (True, False), (False, True)])
+def test_nan_pose_is_ignored_and_the_last_good_pose_kept(node, position, orientation):
+    node.subs['/active_target'](string('workstation'))
+    feed(node, WS, p_pelvis=(1.5, -0.2, 0.45))
+    good = node.latest_pose
+    node.subs['/tracking/output'](nan_det(WS, position, orientation))
+    assert node.latest_pose is good and len(msgs(node, '/workstation_pose')) == 1     # nothing new published
+    assert node.log.has('info', 'NaN pose')
+    frame(node)
+    assert len(msgs(node, '/tracking_visualization')) == 1                            # overlay keeps running
+
+
+def test_nan_pose_never_reaches_the_grasp_topics(node):
+    feed(node, KLT)
+    frame(node)
+    node.subs['/tracking/output'](nan_det(KLT))
+    frame(node)
+    for topic in ('/target_pose_left', '/target_pose_right'):
+        got = msgs(node, topic)
+        assert len(got) == 2 and all(np.isfinite(xyz(m.pose.position)).all() for m in got)
+
+
+def test_nan_before_the_first_pose_keeps_waiting(node):
+    node.subs['/tracking/output'](nan_det(KLT))
+    assert node.latest_pose is None
+
+
 def test_switch_back_resumes_grasp_output(node):
     node.subs['/active_target'](string('workstation'))
     feed(node, WS)

@@ -3,6 +3,7 @@
 targets.yaml maps a target name (the string published on /active_target) to its semantic label,
 mode, expected bbox size and the FoundationPose parameters to apply at runtime.
 """
+import re
 from pathlib import Path
 
 import yaml
@@ -24,10 +25,12 @@ def load_targets(path=None):
 
 
 def find_label_id(label_map, label):
-    """Semantic ID of `label` in Isaac Sim's {"2": {"class": "a,b"}} map, or None.
-    Exact match on the comma-separated labels first, then substring (the old behaviour)."""
+    """Semantic ID of `label` in Isaac Sim's label map, or None. A value is {"class": "a,b"} or, for another
+    semantic instance, a plain string like "table:workstation wikidata_qcode:" (Isaac Sim 5.1).
+    Exact match on a comma/colon/space-separated label first, then substring (the old behaviour)."""
     want = label.lower()
-    for match in (lambda v: want in [s.strip() for s in v.split(',')], lambda v: want in v):
+    exact = lambda v: want in [s.strip() for s in v.split(',')] + re.split(r'[\s,:]+', v)
+    for match in (exact, lambda v: want in v):
         for id_str, d in label_map.items():
             if any(match(str(v).lower()) for v in (d.values() if isinstance(d, dict) else [d])):
                 return int(id_str)

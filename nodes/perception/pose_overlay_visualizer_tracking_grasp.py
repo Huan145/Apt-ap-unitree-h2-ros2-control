@@ -449,7 +449,12 @@ class PoseOverlayVisualizerTracking(Node):
                     f'Ignoring detection with bbox {s.x:.2f}x{s.y:.2f}x{s.z:.2f}m: not "{self.target}" '
                     f'{self.cfg["size"]} (stale output after a switch?)', throttle_duration_sec=2.0)
                 return
-            self.latest_pose     = det.results[0].pose.pose
+            pose = det.results[0].pose.pose
+            if not np.isfinite([pose.position.x, pose.position.y, pose.position.z, pose.orientation.w]).all():
+                self.get_logger().info('NaN pose (FoundationPose is re-estimating): keeping the last good pose',
+                                       throttle_duration_sec=5.0)
+                return
+            self.latest_pose     = pose
             self.latest_box_size = det.bbox.size
             self.latest_stamp    = msg.header.stamp
             p = self.latest_pose.position
