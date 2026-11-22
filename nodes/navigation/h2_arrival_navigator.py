@@ -32,6 +32,8 @@ Parameters: ros2 run style, e.g.  python3 h2_arrival_navigator.py --ros-args -p 
 
 import json
 import math
+import signal
+import time
 import traceback
 from collections import deque
 from enum import Enum
@@ -270,16 +272,15 @@ class H2ArrivalNavigator(Node):
             self.head_hist.append((t, q))
 
     def aim_head(self, msg, t):
-        """Head angle at image time + the table centre's vertical angle off the optical axis: mount tilt and
-        camera TF errors cancel, tracker latency is compensated."""
+        """Head angle at image time + the table centre's elevation off the optical-axis plane (what is left to fix
+        once the robot faces the table): mount tilt and camera TF errors cancel, tracker latency is compensated.
+        atan2(y, z) would blow up for a table far to the side (z -> 0) and pin the head at its limit."""
         T_cam = self.tf(self.p.camera_frame, msg.header.frame_id, msg.header.stamp)
         if not self.p.head_enable or T_cam is None or not self.head_hist:
             return
         c = msg.pose.position
-        pc = T_cam @ (c.x, c.y, c.z, 1.0)                            # camera frame: x right, y down, z forward
-        if pc[2] < 0.05:
-            return
-        self.head_err = math.atan2(pc[1], pc[2])                     # + = table below the image centre
+        x, y, z = (T_cam @ (c.x, c.y, c.z, 1.0))[:3]                 # camera frame: x right, y down, z forward
+        self.head_err = math.atan2(y, math.hypot(x, z))              # + = table below the image centre
         ts, qs = zip(*self.head_hist)
         self.head_target = float(np.interp(t, ts, qs)) + self.p.head_pitch_sign * self.p.head_gain * self.head_err
 
@@ -301,6 +302,19 @@ class H2ArrivalNavigator(Node):
             if self.head_cmd is not None:
                 self.get_logger().info(f'[HEAD] released ({why})')
         self.head_cmd = None
+
+    def stop_robot(self, repeats=5, pause=0.05):
+        """Zero cmd_vel and release the head, repeated: a velocity controller keeps the last command, so one lost
+        sample would leave the robot turning."""
+        for _ in range(repeats):
+            try:
+                self.publish_cmd(0.0, 0.0, 0.0, 'shutdown')
+                if self.p.head_enable:
+                    self.pub_head.publish(Float64(data=float('nan')))
+            except Exception as e:
+                self.get_logger().error(f'[SHUTDOWN] stop command NOT sent: {e!r}')
+                return
+            time.sleep(pause)
 
     # ---------------- services ----------------
 
@@ -567,23 +581,20 @@ class H2ArrivalNavigator(Node):
 
 
 def main():
-    rclpy.init()
+    from rclpy.signals import SignalHandlerOptions
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)     # rclpy's own handlers kill the context before the stop
+    signal.signal(signal.SIGTERM, signal.default_int_handler)      # kill / closing the terminal: same path as Ctrl-C
     node = H2ArrivalNavigator()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            node.publish_cmd(0.0, 0.0, 0.0, 'shutdown')
-            node.pub_head.publish(Float64(data=float('nan')))
-        except Exception:
-            pass
+        for s in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(s, signal.SIG_IGN)                       # a second Ctrl-C must not cut the stop short
+        node.stop_robot()
         node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

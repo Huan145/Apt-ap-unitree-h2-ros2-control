@@ -1,11 +1,15 @@
 import json
 import math
+import signal
+import sys
+import types
 
 import pytest
 from scipy.spatial.transform import Rotation as Rot
 
+import helpers
 import ros_stubs
-from navsim import FakeTF, Sim
+from navsim import PELVIS_Z, TABLE_Z, FakeTF, Sim
 from ros_stubs import Msg
 
 import h2_arrival_navigator as nav
@@ -129,6 +133,81 @@ def test_start_twice_is_refused_and_cancel_stops_and_releases_the_head():
     assert r.success and n.phase is nav.Phase.IDLE and cmd(n) == (0.0, 0.0, 0.0)
     assert math.isnan(n.pubs['head_pitch_cmd'].msgs[-1].data) and n.pubs['~/status'].msgs[-1].data == 'idle'
     no_crash(n)
+
+
+# ---------------- head and shutdown ----------------
+
+def test_head_aims_at_the_tables_elevation_not_its_bearing():
+    """Same camera -> table-centre range straight ahead and 77 deg to the right: the same head angle. (atan2(y, z)
+    pinned the head at its limit for the table off to the side: z -> 0.)"""
+    dh = PELVIS_Z + helpers.T_PELVIS_CAM[2] - TABLE_Z                          # camera above the table centre
+    rng = math.hypot(0.8, 3.87)                                                # horizontal, camera -> table centre
+    for table in ((0.1 + rng, 0.0, math.pi / 2), (0.9, -3.87, 0.0)):
+        n = make()
+        sim = Sim(n, table=table, sigma=(0.0, 0.0), fov=math.radians(179), blocked_below=0.0)
+        n.phase = nav.Phase.SCAN
+        n.head_hist.append((0.0, 0.0))
+        n.on_pose(sim.pose_msg(0.0))
+        assert n.head_target == pytest.approx(n.p.head_gain * math.atan2(dh, rng), abs=2e-3)
+        assert n.head_target < n.p.head_pitch_max
+
+
+def test_stop_robot_repeats_the_zero_command_and_releases_the_head():
+    n = make()
+    n.publish_cmd(0.0, 0.0, -0.5, 'turning')
+    n.stop_robot(pause=0.0)
+    assert len(n.pubs['cmd_vel'].msgs) == 6 and all(m.angular.z == 0.0 for m in n.pubs['cmd_vel'].msgs[1:])
+    assert [math.isnan(m.data) for m in n.pubs['head_pitch_cmd'].msgs] == [True] * 5
+
+
+def test_stop_robot_reports_instead_of_raising_when_the_context_is_gone(monkeypatch):
+    n = make()
+
+    def invalid(_):
+        raise RuntimeError("publisher's context is invalid")
+    monkeypatch.setattr(n.pub_cmd, 'publish', invalid)
+    n.stop_robot(pause=0.0)                                                    # must not raise
+    assert n.log.has('error', 'stop command NOT sent')
+
+
+def test_main_sends_the_stop_on_ctrl_c_before_rclpy_shuts_down(monkeypatch):
+    """Seen live: rclpy's own SIGINT handler shut the context down before the stop could go out, and the controller
+    kept the last cmd_vel. main() must switch that handler off, ignore a second Ctrl-C while stopping, shut rclpy
+    down only after the stop, and treat SIGTERM like Ctrl-C."""
+    n = make()
+    n.publish_cmd(0.0, 0.0, -0.5, 'turning')
+    NO = object()
+    ctx = types.SimpleNamespace(valid=True, opt=None, sig=[])
+
+    def spin(_):
+        ctx.valid = ctx.opt is NO                                              # rclpy's default handler ends the context
+        raise KeyboardInterrupt
+
+    def guard(pub):
+        real = pub.publish
+
+        def publish(m):
+            if not ctx.valid:
+                raise RuntimeError("publisher's context is invalid")
+            real(m)
+        monkeypatch.setattr(pub, 'publish', publish)
+    guard(n.pub_cmd)
+    guard(n.pub_head)
+    signals = types.ModuleType('rclpy.signals')
+    signals.SignalHandlerOptions = types.SimpleNamespace(NO=NO)
+    monkeypatch.setitem(sys.modules, 'rclpy.signals', signals)
+    monkeypatch.setattr(nav.rclpy, 'init', lambda **kw: setattr(ctx, 'opt', kw.get('signal_handler_options')))
+    monkeypatch.setattr(nav.rclpy, 'spin', spin)
+    monkeypatch.setattr(nav.rclpy, 'try_shutdown', lambda: setattr(ctx, 'valid', False), raising=False)
+    monkeypatch.setattr(signal, 'signal', lambda s, h: ctx.sig.append((s, h)))     # not the test runner's handlers
+    monkeypatch.setattr(nav.time, 'sleep', lambda s: None)
+    monkeypatch.setattr(nav, 'H2ArrivalNavigator', lambda: n)
+    nav.main()
+    assert not n.log.has('error', 'NOT sent')
+    assert len(n.pubs['cmd_vel'].msgs) == 6 and all(m.angular.z == 0.0 for m in n.pubs['cmd_vel'].msgs[1:])
+    assert [math.isnan(m.data) for m in n.pubs['head_pitch_cmd'].msgs] == [True] * 5
+    assert (signal.SIGTERM, signal.default_int_handler) in ctx.sig
+    assert (signal.SIGINT, signal.SIG_IGN) in ctx.sig and (signal.SIGTERM, signal.SIG_IGN) in ctx.sig
 
 
 # ---------------- scan ----------------
