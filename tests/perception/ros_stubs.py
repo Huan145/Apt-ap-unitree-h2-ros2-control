@@ -41,13 +41,23 @@ class Publisher:
         self.msgs.append(m)
 
 
+class Clock:
+    """Sim clock a test advances with `node.get_clock().t = seconds`."""
+    t = 0.0
+
+    def now(self):
+        t = self.t
+        return SimpleNamespace(nanoseconds=int(round(t * 1e9)),
+                               to_msg=lambda: Msg(sec=int(t), nanosec=int(round((t % 1) * 1e9))))
+
+
 class Node:
     overrides = {}          # parameter overrides, set by a test before it builds a node
     client_factory = None   # fake service client, set by the switcher tests
 
     def __init__(self, name, **kw):
-        self.name, self._params, self.log = name, {}, Logger()
-        self.subs, self.pubs = {}, {}
+        self.name, self._params, self.log, self.clock = name, {}, Logger(), Clock()
+        self.subs, self.pubs, self.srvs, self.timers = {}, {}, {}, []
 
     def get_logger(self):                         return self.log
     def declare_parameter(self, name, default=None):
@@ -56,6 +66,10 @@ class Node:
     def create_subscription(self, t, topic, cb, qos): self.subs[topic] = cb
     def create_client(self, t, name):             return Node.client_factory(name)
     def destroy_node(self):                       pass
+    def get_clock(self):                          return self.clock
+    def set_parameters(self, params):             pass
+    def create_service(self, t, name, cb):        self.srvs[name] = cb
+    def create_timer(self, period, cb):           self.timers.append((period, cb))
 
     def create_publisher(self, t, topic, qos):
         self.pubs[topic] = Publisher()
@@ -63,6 +77,8 @@ class Node:
 
 
 class Parameter:
+    Type = SimpleNamespace(BOOL='bool')
+
     def __init__(self, name, type_=None, value=None):
         self.name, self.value = name, value
 
@@ -78,10 +94,14 @@ class Buffer:
             raise LookupException('no transform')
         return Buffer.T
 
+    def all_frames_as_string(self):
+        return ''
 
-class LookupException(Exception): pass
-class ConnectivityException(Exception): pass
-class ExtrapolationException(Exception): pass
+
+class TransformException(Exception): pass
+class LookupException(TransformException): pass
+class ConnectivityException(TransformException): pass
+class ExtrapolationException(TransformException): pass
 
 
 def _module(name, **attrs):
@@ -100,7 +120,8 @@ def install():
     if _MSG_TYPES:
         return _MSG_TYPES
     msg_types = {c: type(c, (Msg,), {}) for c in
-                 ('Image', 'CameraInfo', 'Detection3DArray', 'PoseStamped', 'String')}
+                 ('Image', 'CameraInfo', 'Detection3DArray', 'PoseStamped', 'String',
+                  'Twist', 'PointStamped', 'Float64', 'JointState')}
     time_m = _module('rclpy.time', Time=type('Time', (), {'from_msg': staticmethod(lambda s: s)}))
     dur_m = _module('rclpy.duration', Duration=lambda seconds=0: seconds)
     _module('rclpy', init=lambda *a, **k: None, shutdown=lambda: None, spin=lambda n: None,
@@ -110,15 +131,20 @@ def install():
     _module('rcl_interfaces')
     _module('rcl_interfaces.srv', SetParameters=type('SetParameters', (), {'Request': Msg}))
     _module('sensor_msgs')
-    _module('sensor_msgs.msg', Image=msg_types['Image'], CameraInfo=msg_types['CameraInfo'])
+    _module('sensor_msgs.msg', Image=msg_types['Image'], CameraInfo=msg_types['CameraInfo'],
+            JointState=msg_types['JointState'])
     _module('std_msgs')
-    _module('std_msgs.msg', String=msg_types['String'])
+    _module('std_msgs.msg', String=msg_types['String'], Float64=msg_types['Float64'])
     _module('vision_msgs')
     _module('vision_msgs.msg', Detection3DArray=msg_types['Detection3DArray'])
     _module('geometry_msgs')
-    _module('geometry_msgs.msg', PoseStamped=msg_types['PoseStamped'])
+    _module('geometry_msgs.msg', PoseStamped=msg_types['PoseStamped'], Twist=msg_types['Twist'],
+            PointStamped=msg_types['PointStamped'])
+    _module('std_srvs')
+    _module('std_srvs.srv', Trigger=type('Trigger', (), {}))
+    _module('rclpy.qos', QoSProfile=lambda **kw: kw, DurabilityPolicy=SimpleNamespace(TRANSIENT_LOCAL='tl'))
     _module('tf2_ros', Buffer=Buffer, TransformListener=lambda buf, node: None,
             LookupException=LookupException, ConnectivityException=ConnectivityException,
-            ExtrapolationException=ExtrapolationException)
+            ExtrapolationException=ExtrapolationException, TransformException=TransformException)
     _MSG_TYPES = msg_types
     return msg_types

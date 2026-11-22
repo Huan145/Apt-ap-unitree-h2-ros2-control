@@ -136,7 +136,8 @@ RGB + depth + mask ─► Selector ─┬─► ESTIMATION  from scratch: severa
   visualizer skips NaN and keeps the last good pose.
 - **Walking.** Tracking must follow large frame-to-frame motion with one refine step per frame, an estimation takes
   seconds and its result is already old when it arrives, and the pose is stamped in the pelvis frame of the image
-  time. Live pose can lag during a walk: latch the pose while standing and walk on odometry.
+  time. Live pose can lag during a walk: latch the pose while standing and walk on odometry
+  (done in `arrival_navigator.md`).
 
 ## Behaviour to know
 
@@ -163,7 +164,7 @@ RGB + depth + mask ─► Selector ─┬─► ESTIMATION  from scratch: severa
 
 ## Tests
 
-`pytest tests/perception` (46 tests, no ROS needed: small stand-ins for rclpy/messages/TF). They pin the
+`pytest tests/perception` (46 tests; the navigation tests are in `arrival_navigator.md`, no ROS needed: small stand-ins for rclpy/messages/TF). They pin the
 grasp poses of the unmodified visualizer for 5 box yaws, the pose-mode transform and timestamp, the size
 gate, NaN poses being skipped, the mask node switching, the label lookup (including the lab's real Isaac Sim 5.1
 label map), the switcher's retry/lock behaviour and the mesh checker (including `--flatten`).
