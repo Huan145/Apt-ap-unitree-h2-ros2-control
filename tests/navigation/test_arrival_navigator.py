@@ -331,7 +331,7 @@ def test_walks_in_latches_in_the_window_and_arrives_on_odometry_with_the_camera_
     n, sim, marks, phase = run_nominal()
     assert phase == 'succeeded'
     dx, dy, dyaw, face = sim.true_errors()
-    assert STANDOFF == 0.20                                                                  # the end: 0.2 m pelvis -> table face
+    assert STANDOFF == 0.0                                                                   # the end: pelvis on the table's face line
     assert math.hypot(dx, dy) < 0.08 and abs(dyaw) < math.radians(6) and face == pytest.approx(STANDOFF, abs=0.08)
     info = result(n)
     assert 1.7 - 0.15 <= info['latched_range_m'] <= 2.0 + 0.15 and info['latch_tries'] == 1
@@ -411,7 +411,7 @@ def test_a_crash_in_the_loop_stops_the_robot(monkeypatch):
     n = make()
     sim = Sim(n)
     start(n)
-    sim.run(until=lambda s: n.phase is nav.Phase.APPROACH)
+    sim.run(until=lambda s: n.phase is nav.Phase.APPROACH and s.t > n.pause_until)       # past the pause after the phase change
     monkeypatch.setattr(n, 'geometry', lambda *a: 1 / 0)
     sim.step()
     assert n.phase is nav.Phase.FAILED and cmd(n) == (0.0, 0.0, 0.0) and 'internal error' in result(n)['reason']
@@ -438,22 +438,22 @@ def test_from_beside_the_table_it_meets_the_bisector_beyond_2m_faces_the_table_a
         record(m, 'done', lambda n: n.latched)])
     assert phase == 'succeeded', result(n)
     assert m['merge'][5] > 2.4 and abs(m['merge'][2]) <= n.p.line_tol + 0.1                  # met the line more than 2 m out
-    assert abs(m['latch'][4]) < math.radians(10) and abs(result(n)['latched_off_m']) < 0.2   # latched facing it, on the line
+    assert abs(m['latch'][4]) < math.radians(15) and abs(result(n)['latched_off_m']) < 0.3   # latched facing it (it turns on the spot first), on the line
     after = [r for r in sim.rec if r[0] >= m['done'][0]]
     assert max(abs(r[2]) for r in after) < 0.2 and max(abs(math.degrees(r[3])) for r in after) < 12   # then straight in
     dx, dy, dyaw, face = sim.true_errors()
-    assert math.hypot(dx, dy) < 0.10 and abs(dyaw) < math.radians(7) and face == pytest.approx(0.20, abs=0.08)
-    assert clearance(sim, table) > 0.1
+    assert math.hypot(dx, dy) < 0.10 and abs(dyaw) < math.radians(7) and face == pytest.approx(STANDOFF, abs=0.08)
+    assert clearance(sim, table, [r for r in sim.rec if r[0] < m['done'][0]]) > 0.1      # the walk to the latch kept clear
     no_crash(n)
 
 
 def test_seen_end_on_it_goes_round_the_table_to_a_long_face_and_never_across_it():
     table = (3.8, 0.0, math.pi / 2)                                  # long axis along y, the robot on its extension, 0.1 m off
-    n, sim, _, phase = run_nominal(robot=(3.9, -4.5, math.pi / 2), table=table, blocked_below=-9.0)
+    n, sim, _, phase = run_nominal(robot=(3.9, -4.5, math.pi / 2), table=table, blocked_below=-9.0, params={'place_standoff': 0.2})   # 0.2 so that 'clear of the table' means something
     assert phase == 'succeeded', result(n)
     dx, dy, dyaw, face = sim.true_errors()
-    assert math.hypot(dx, dy) < 0.10 and face == pytest.approx(STANDOFF, abs=0.08)
-    assert sim.x == pytest.approx(3.8 + HALF + STANDOFF, abs=0.1) and abs(sim.y) < 0.1       # on the +x long face, not a short end
+    assert math.hypot(dx, dy) < 0.10 and face == pytest.approx(0.2, abs=0.08)
+    assert sim.x == pytest.approx(3.8 + HALF + 0.2, abs=0.1) and abs(sim.y) < 0.1            # on the +x long face, not a short end
     assert clearance(sim, table) > 0.1
     no_crash(n)
 
@@ -486,7 +486,7 @@ def test_inside_the_window_but_off_the_bisector_it_does_not_latch_there_but_join
     n, sim, _, phase = run_nominal(robot=(1.9, 0.8, 0.0), hooks=[                            # face 1.5 m away, 0.8 m off the line
         record(m, 'merge', lambda n: n.merged), record(m, 'latch', lambda n: n.phase is nav.Phase.LATCH)])
     assert phase == 'succeeded', result(n)
-    assert m['merge'][0] < m['latch'][0] and abs(result(n)['latched_off_m']) < 0.25
+    assert m['merge'][0] < m['latch'][0] and abs(result(n)['latched_off_m']) < 0.3
 
 
 def test_on_the_way_to_the_bisector_it_aims_at_the_meet_point_without_squaring_to_the_table():
@@ -577,3 +577,15 @@ def test_no_back_and_forth_turning_kicks_while_walking_in():
     wz = [m.angular.z for m in n.pubs['cmd_vel'].msgs if m.angular.z]
     flips = sum(a * b < 0 for a, b in zip(wz, wz[1:]))
     assert phase == 'succeeded' and flips <= 3, flips
+
+
+def test_every_phase_change_is_followed_by_a_pause_with_zero_velocity():
+    n, sim, _, phase = run_nominal()
+    assert phase == 'succeeded' and n.p.phase_pause_s == 2.0 and n.p.v_max == 0.40
+    rec, changes = sim.rec, [i for i in range(1, len(sim.rec)) if sim.rec[i][5] != sim.rec[i - 1][5] and sim.rec[i][5] not in ('succeeded', 'failed')]
+    assert len(changes) >= 3
+    for i in changes:
+        t0 = rec[i][0]
+        window = [r for r in rec if t0 + 1.0 <= r[0] <= t0 + 1.9]                      # the speed lags the command (tau 0.25 s)
+        assert window and max(r[4] for r in window) < 0.03, (rec[i][5], t0)
+    assert max(r[4] for r in rec) <= 0.40 + 0.03

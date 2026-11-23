@@ -3,7 +3,7 @@
 `nodes/navigation/h2_arrival_navigator.py`, a sibling of `h2_local_navigator.py` (same services, `cmd_vel`,
 `head_pitch_cmd`, velocity shaping, `[CMD]`/`[HB]` logs). The robot comes in along the table's **bisector** (the line
 through the table centre, normal to its long side), **stops to latch** the table pose 1.7 to 2.0 m from the face, and
-walks the last stretch **straight in on odometry** to 0.2 m from the face, because the camera is blocked near the table
+walks the last stretch **straight in on odometry** to the table face (`place_standoff` 0.0), because the camera is blocked near the table
 (box in the hands, table filling the view). The table is tracked in a **fixed frame**.
 
 ```
@@ -13,7 +13,7 @@ SCAN ─► ROTATE/APPROACH leg "meet"  ──(within 0.4 m of the bisector)─�
                                                               real distance to the face ≤ 2.0 m
                                                                                        ▼
    done ◄─ FINAL_ALIGN ◄─ ROTATE/APPROACH, straight in ◄─ freeze ◄─ LATCH: stop, turn to face the table if needed,
-          (0.2 m from the face,    on odometry, vision ignored       wait 1.5 s, poses taken after that agree
+          (pelvis at the face,      on odometry, vision ignored       wait 1.5 s, poses taken after that agree
            square to it)                                              (camera blind from ~1.2 m)
 ```
 
@@ -30,7 +30,7 @@ SCAN ─► ROTATE/APPROACH leg "meet"  ──(within 0.4 m of the bisector)─�
    pursuit), so the path melts into the line and arrives on it, instead of meeting it only at the end point. A robot that
    starts on the bisector skips the meet leg.
 4. **Latch** at a real distance to the face ≤ `latch_far` (2.0 m), see below.
-5. **Straight in** on the frozen table and the pelvis pose from TF to `place_standoff` (0.20 m, pelvis to face), then
+5. **Straight in** on the frozen table and the pelvis pose from TF to `place_standoff` (0.0 m, pelvis on the face line), then
    FINAL_ALIGN: yaw first, then x/y creep (±5 cm, ±4°), 20 settled cycles, `succeeded`.
 
 It never walks backwards: if the meet point is behind the robot (it starts close to the table and off the line), it
@@ -120,7 +120,7 @@ ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{}"
 | parameter | default | note |
 |---|---|---|
 | `odom_frame` | `odom` | the fixed frame in TF: **`world` in Isaac Sim** (pass `-p odom_frame:=world`) |
-| `place_standoff` | 0.20 | pelvis → table near face at the end. The carry pose of `H2_pickup_sequencer` (grip x 0.20 m, box 0.30 m deep) puts the box front 0.35 m ahead of the pelvis, so **the box ends 0.15 m over the table edge** and the box front passes the edge 0.15 m before the end: the carry height must clear the table top (1.05 m) by then. Box front to face 0.20 m would be 0.55 |
+| `place_standoff` | 0.0 | pelvis → table near face at the end (was 0.20). The carry pose of `H2_pickup_sequencer` puts the box front 0.35 m ahead of the pelvis, so **the box ends 0.35 m over the table and the pelvis touches the table's face**: the carry height must clear the table top (1.05 m), and the estimate error (a few cm, up to ~0.1 m seen) can push the robot into the table. Box front to face 0.20 m would be 0.55 |
 | `lateral_offset` | 0.0 | stand this far to the robot's **left** of the table centre (the bisector moves with it) |
 | `meet_dist` | 3.0 | m, meet point on the bisector, from the face. Keep it above `latch_far` |
 | `line_tol` | 0.4 | m, this close to the bisector counts as on it (also the warning limit at the latch) |
@@ -132,7 +132,9 @@ ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{}"
 | `latch_pos_tol`, `latch_yaw_tol` | 0.05 m, 3° | how well the two halves must agree |
 | `max_range` | 9.0 | m, poses further than this are rejected. Needs `max_depth` 10.0 in the FoundationPose launch (see `target_switching.md`) |
 | `scan_wait_s`, `scan_w`, `scan_dir` | 3.0, 0.70, +1 | stand still, then turn left at 0.7 rad/s; fails after `scan_max_deg` 400 |
-| `v_min v_max w_min w_max kp_* *_tol` | as `h2_local_navigator` | tuned there for the **no-box** policy; check them with the box |
+| `phase_pause_s` | 2.0 | s, the robot stands still (zero `cmd_vel`) after every phase change (SCAN → ROTATE → APPROACH → LATCH → ROTATE → APPROACH → FINAL, and each ROTATE ↔ APPROACH switch) so it settles. 0 turns it off |
+| `v_max` | 0.40 | m/s walking speed limit (`h2_local_navigator` uses 0.50). `v_min` 0.17 |
+| `w_min w_max kp_* *_tol` | as `h2_local_navigator` | tuned there for the **no-box** policy; check them with the box |
 | `head_*` | as `h2_local_navigator` | aims at the table centre's **elevation** (independent of where the robot faces), held after the latch. The free-box policy was trained with head pitch 0: if it walks badly with the head down, cap it with `-p head_pitch_max:=0.3` |
 
 ## Reading the `[HB]` line
@@ -155,7 +157,7 @@ success carries `face_dist_m` (pelvis → table face, what the place step needs)
 
 ## Tests
 
-`pytest tests` (97 in all; 51 in `tests/navigation`, no ROS needed). They drive the node in a small kinematic world
+`pytest tests` (98 in all; 52 in `tests/navigation`, no ROS needed). They drive the node in a small kinematic world
 (`navsim.py`): velocity lag 0.25 s, vision 0.3 s late and noisy, camera blind below 1.2 m, tracker gaps, 180° flips,
 a re-estimation jump inside the latch window, odometry loss. They check arrival within 8 cm / 6° of the goal (10 cm / 7°
 for the noisy and sideways cases), and the new approach: from beside the table's end the robot meets the bisector more
@@ -181,7 +183,7 @@ ignores the turn, …).
   compare the latched `axis` with the table's Rotate Z in Isaac Sim.
 
 **Not verified** (no ROS, GPU or robot here): real tracker noise and lag, whether 10 m of `max_depth` fixes the axis,
-how the free-box policy follows `cmd_vel` with the head tilted, the carry height at the 0.2 m end, and `main()` on a real
+how the free-box policy follows `cmd_vel` with the head tilted, the carry height and any contact with the table at the 0.0 end, and `main()` on a real
 rclpy (its signal handling follows the rclpy source and is tested on a stub). The table's pose along its long axis can
 be off by ~0.3 m between FoundationPose estimations; this node cannot fix that, it only keeps the robot from chasing it.
 Known limit: no path planning around the table; the meet leg is a straight line, safe for a robot in front of a long

@@ -63,8 +63,8 @@ PARAMS = dict(
     # table (size from targets.yaml) and where to stand
     table_depth=0.762,          # m, short side (mesh X)
     table_length=2.474,         # m, long side (mesh Y)
-    place_standoff=0.20,        # m, pelvis -> table near face at the end. The carry pose of H2_pickup_sequencer holds the box
-                                #    front 0.35 m ahead of the pelvis (grip x 0.20 + half the 0.30 m box): 0.15 m over the edge
+    place_standoff=0.00,        # m, pelvis -> table near face at the end. The carry pose of H2_pickup_sequencer holds the box
+                                #    front 0.35 m ahead of the pelvis (grip x 0.20 + half the 0.30 m box): 0.35 m over the table at 0.0
     lateral_offset=0.0,         # m, stand this far to the robot's LEFT of the table centre (the bisector moves with it)
     # approach: meet the bisector, then walk in along it
     meet_dist=3.0,              # m, meet point on the bisector, from the near face (keep it above latch_far)
@@ -85,10 +85,10 @@ PARAMS = dict(
     # pose sanity
     max_range=9.0, min_horizontal_y=0.20,
     # motion: same names and defaults as h2_local_navigator (tuned there for the no-box policy)
-    v_min=0.17, v_max=0.50, w_min=0.25, w_max=0.50, kp_lin=1.0, kp_ang=1.5, kp_perp=0.6,
+    v_min=0.17, v_max=0.40, w_min=0.25, w_max=0.50, kp_lin=1.0, kp_ang=1.5, kp_perp=0.6,
     sidestep_max_s=2.0, sidestep_pause_s=2.0,
     pos_tol=0.05, yaw_tol=math.radians(4), capture_radius=0.15, bearing_gate=math.radians(30),
-    settle_cycles=20, settle_hyst=1.4, nav_timeout_s=120.0, lost_grace_s=5.0,
+    settle_cycles=20, settle_hyst=1.4, nav_timeout_s=180.0, phase_pause_s=2.0, lost_grace_s=5.0,
     # head (center mode of h2_local_navigator: keep the table centre in the vertical middle of the image)
     head_enable=True, head_joint='head_pitch_joint', head_pitch_sign=1.0, head_pitch_min=-0.5,
     head_pitch_max=0.5, head_gain=0.7, head_deadband=math.radians(1.0), head_hold_after_done=True,
@@ -179,6 +179,7 @@ class H2ArrivalNavigator(Node):
         self.samples = deque(maxlen=100)           # (image time, x, y, long-axis angle) in the odom frame
         self.est, self.latched, self.tries, self.latch_info = None, False, 0, {}
         self.merged, self.n_ref = False, None      # reached the bisector / the table side (unit normal) chosen first
+        self.pause_until = 0.0                     # standing still until then (a pause after every phase change)
         self.live, self.face_yaw = None, 0.0       # newest pose after the latch (logged only) / heading (odom) that faces the table
         self.t_start = self.t_latch = self.latch_t0 = self.lost_since = self.side_since = self.yaw_prev = None
         self.side_pause_until, self.settle, self.scanned = 0.0, 0, 0.0
@@ -437,6 +438,8 @@ class H2ArrivalNavigator(Node):
                 return self.fail(f'no TF {p.odom_frame} <- {p.pelvis_frame} for {p.lost_grace_s}s')
             return self.publish_cmd(0.0, 0.0, 0.0, 'no odometry')
         self.lost_since = None
+        if now < self.pause_until:               # between phases: stand still so the robot settles
+            return self.publish_cmd(0.0, 0.0, 0.0, f'pause {self.pause_until - now:.1f}s after the phase change')
         if self.phase is Phase.SCAN:
             return self.scan_step(now, r)
         if self.phase is Phase.LATCH:
@@ -636,6 +639,8 @@ class H2ArrivalNavigator(Node):
             self.get_logger().info(f'Phase -> {phase.value}')
             self.phase = phase
             self.settle = 0
+            if phase in RUNNING and phase is not Phase.SCAN and self.p.phase_pause_s > 0:
+                self.pause_until = self.now() + self.p.phase_pause_s
             self.publish_status()
 
     def publish_status(self):
