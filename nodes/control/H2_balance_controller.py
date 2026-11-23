@@ -19,8 +19,9 @@ BEFORE pressing Play, so the policy balances from the first physics step.
 Startup: the robot should already stand in the TRAINING start pose
 (policy_io.json default_joint_pos - check with check_start_pose.py); the
 policy starts on the first control step and logs a warning for any joint more
-than START_TOL rad off. Arms hold the training default pose until the
-sequencer's first /arm_targets message. Optional: --ramp/--hold ease all
+than START_TOL rad off. Arms hold their MEASURED pose at policy start (for a pickup that is the
+training default; a robot that starts holding a box keeps holding it) until /arm_targets or an
+applied command on --applied-topic arrives. Optional: --ramp/--hold ease all
 joints into the default pose first (off by default); arm targets that arrive
 before "Policy active" are ignored.
 
@@ -385,8 +386,10 @@ class BalanceController(Node):
             self.publish(self.joint_names, self.startup_q + a * (self.default_pos - self.startup_q))
         if t >= self.ramp_s + self.hold_s:
             self.policy_active = True
-            self.arm_target = self.default_pos[self.arm_idx].copy()   # as at the start of every training episode
-            self.get_logger().info("Policy active - start the sequencer when the robot is steady")
+            self.arm_target = self.q[self.arm_idx].copy()   # hold where the arms ARE (pickup start: = training default)
+            off = np.abs(self.arm_target - self.default_pos[self.arm_idx]).max()
+            self.get_logger().info(f"Policy active - arms held at their measured pose (max {off:.2f} rad from the "
+                                   "training default); start the sequencer when the robot is steady")
 
     def publish(self, names, positions):
         msg = JointState()
