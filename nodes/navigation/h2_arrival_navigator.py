@@ -81,7 +81,7 @@ PARAMS = dict(
     latch_pos_tol=0.05, latch_yaw_tol=math.radians(3),   # m, rad: the two halves of the window must agree this well
     latch_timeout_s=20.0,       # s (tracker gaps of 2-9 s were seen)
     # scan
-    scan_wait_s=3.0, scan_w=0.25, scan_dir=1.0, scan_max_deg=400.0, min_samples=3,
+    scan_wait_s=3.0, scan_w=0.70, scan_dir=1.0, scan_max_deg=400.0, min_samples=3,
     # pose sanity
     max_range=9.0, min_horizontal_y=0.20,
     # motion: same names and defaults as h2_local_navigator (tuned there for the no-box policy)

@@ -19,7 +19,7 @@ SCAN ─► ROTATE/APPROACH leg "meet"  ──(within 0.4 m of the bisector)─�
 
 ## The approach (what the robot does, in order)
 
-1. **SCAN.** No table yet: stand 3 s, then turn left at 0.25 rad/s until 3 poses arrive (gives up after 400°).
+1. **SCAN.** No table yet: stand 3 s, then turn left at 0.7 rad/s until 3 poses arrive (gives up after 400°).
 2. **Meet leg.** If the robot is more than `line_tol` (0.4 m) off the bisector it walks to the **meet point**: on the
    bisector, `meet_dist` (3.0 m) from the table face, aiming at it only (no squaring to the table on the way). The
    robot is always on its own side of the table; beside the table's long-axis plane (±0.5 m) it keeps the side it chose
@@ -131,7 +131,7 @@ ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{}"
 | `latch_settle_s`, `window_s`, `latch_samples` | 1.5, 1.0, 5 | |
 | `latch_pos_tol`, `latch_yaw_tol` | 0.05 m, 3° | how well the two halves must agree |
 | `max_range` | 9.0 | m, poses further than this are rejected. Needs `max_depth` 10.0 in the FoundationPose launch (see `target_switching.md`) |
-| `scan_wait_s`, `scan_w`, `scan_dir` | 3.0, 0.25, +1 | stand still, then turn left at 0.25 rad/s; fails after `scan_max_deg` 400 |
+| `scan_wait_s`, `scan_w`, `scan_dir` | 3.0, 0.70, +1 | stand still, then turn left at 0.7 rad/s; fails after `scan_max_deg` 400 |
 | `v_min v_max w_min w_max kp_* *_tol` | as `h2_local_navigator` | tuned there for the **no-box** policy; check them with the box |
 | `head_*` | as `h2_local_navigator` | aims at the table centre's **elevation** (independent of where the robot faces), held after the latch. The free-box policy was trained with head pitch 0: if it walks badly with the head down, cap it with `-p head_pitch_max:=0.3` |
 

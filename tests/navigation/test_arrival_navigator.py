@@ -250,7 +250,7 @@ def test_scan_stands_still_then_turns_then_gives_up():
     sim.run(until=lambda s: s.t >= 1.8)
     assert cmd(n) == (0.0, 0.0, 0.0)
     sim.run(until=lambda s: s.t >= 3.0)
-    assert cmd(n)[2] == pytest.approx(0.25)
+    assert cmd(n)[2] == pytest.approx(n.p.scan_w) and n.p.scan_w == 0.70
     assert sim.run() == 'failed'
     r = result(n)
     assert 'table not found' in r['reason'] and r['phase'] == 'scan' and cmd(n) == (0.0, 0.0, 0.0)
