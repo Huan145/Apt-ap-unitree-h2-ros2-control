@@ -26,7 +26,23 @@ not on a timer:
               width about that pose's midpoint, along a straight Cartesian path (CARRY_STEPS IK
               knots) so the grip width holds the whole way. Same box width -> exactly CARRY_POSE.
               The training arm motion ends on the same pose (h2_balance mdp/commands.py).
-  6 hold      the carry pose
+  6 hold      the carry pose, while the robot walks (h2_fullbody_box_controller holds /arm_targets);
+              waits for  ros2 topic pub --once /sequencer_cmd std_msgs/msg/String "{data: place}"
+PLACE (same process: it knows the squeezed grip command + the load; the balance controller must
+be back in control first: /controller_select "balance"):
+  7 lower     both hands straight down (Cartesian, grip width + orientation kept) until their
+              midpoint is --place-z above the pelvis (+ --place-dx forward), >= --place-time s;
+              ends after CONTACT_TIMEOUT_S if the table stops the box first
+  8 unload    arms still; box-weight compensation fades out over LOAD_RAMP_S
+  9 release   hands straight out by GRASP_REACH_M + --squeeze (the pinch, reversed)
+ 10 retract   to the wide pose (as phase 1, position only)
+ 11 home      joint space to HOME_POSE = arm defaults of UNITREE_H2_CFG (walking + balance policies)
+ 12 done      hold HOME_POSE -> hand over to the no-box walking controller
+--place-only: start HERE with the robot already holding the box (no pickup, no FoundationPose targets):
+  grip      hands in by --squeeze from the MEASURED pose (a fresh process has no squeezed command),
+            box-weight compensation on from the start; then lower ... done as above
+load_expected stays True from carry to the end ("flag 1, no load" is in the training distribution;
+1 -> 0 never happens in training).
 
 "Outside / inward" = along the horizontal line between the two targets, so the
 targets' orientation convention does not matter. The target is the grasp
@@ -62,6 +78,7 @@ time (sim time in Isaac Sim), using only /joint_states messages with an /imu
 message of the same stamp, like the balance controller.
 
 Subscribes: /target_pose_left, /target_pose_right (PoseStamped, pelvis frame, hand link pose)
+            /sequencer_cmd (std_msgs/String): "place" starts phase 7 from hold
             /joint_states + /imu
 Publishes:  /arm_targets (JointState, 14 arm joints, rad) at 50 Hz -> H2_balance_controller
             /load_expected (Bool): True from the start of carry (the lift), as in training
@@ -88,7 +105,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation, Slerp
 from sensor_msgs.msg import Imu, JointState
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 URDF_PATH = os.path.join(_REPO_ROOT, "assets", "h2_description", "H2.urdf")
@@ -123,22 +140,33 @@ CARRY_POSE_DICT = {
     "left_wrist_pitch_joint": -0.00027, "right_wrist_pitch_joint": -0.00063,
     "left_wrist_yaw_joint": 0.05243, "right_wrist_yaw_joint": -0.05767,
 }
-CARRY_STEPS = 10          # IK knots on the carry path
+CARRY_STEPS = 10          # IK knots on the carry / lower / release paths
+# Arm defaults of UNITREE_H2_CFG (h2_locomotion assets/unitree_h2.py): start pose of the walking AND balance
+# policies; joints not listed there are 0.
+HOME_POSE_DICT = {n: 0.0 for n in ["left_shoulder_yaw_joint", "right_shoulder_yaw_joint", "left_wrist_roll_joint",
+                                   "right_wrist_roll_joint", "left_wrist_pitch_joint", "right_wrist_pitch_joint",
+                                   "left_wrist_yaw_joint", "right_wrist_yaw_joint"]}
+HOME_POSE_DICT.update({"left_shoulder_pitch_joint": 0.28, "right_shoulder_pitch_joint": 0.28,
+                       "left_shoulder_roll_joint": 0.16, "right_shoulder_roll_joint": -0.16,
+                       "left_elbow_joint": 0.52, "right_elbow_joint": 0.52})
 # Phase machine
-PHASES = ["wide", "standoff", "pinch", "tilt", "carry", "hold"]
+PHASES = ["wide", "standoff", "pinch", "tilt", "carry", "hold",
+          "grip", "lower", "unload", "release", "retract", "home", "done"]   # grip: --place-only
+PATHS = {"carry", "grip", "lower", "release"}     # straight Cartesian paths through CARRY_STEPS IK knots
+WAIT = {"hold", "done"}                   # no move; hold waits for /sequencer_cmd "place"
 LIVE = {"standoff"}                       # replanned (after the current move) when the target moved
 RETRY = {"wide", "standoff", "pinch"}     # an IK-rejected arm retries on the next target update
-CONTACT = {"pinch", "tilt", "carry"}      # may be blocked by the box -> end after CONTACT_TIMEOUT_S
+CONTACT = {"pinch", "tilt", "carry", "grip", "lower", "unload", "release"}   # may be blocked -> end after CONTACT_TIMEOUT_S
 CONTACT_TIMEOUT_S = 1.0
 WARN_EVERY_S = 2.0
 WAIT_TIMEOUT_S = 10.0
 LEVEL_WARN_M = 0.03       # warn when the two targets differ in height by more than this
 SETTLE_S, SETTLE_MOVE_MM = 1.0, 2.0      # hands moved < 2 mm in 1 s = settled
-SETTLED_MAX_MM = {"wide": np.inf, "standoff": 30.0}   # settled within this -> phase ends anyway (warning);
+SETTLED_MAX_MM = {"wide": np.inf, "standoff": 30.0, "retract": np.inf, "home": np.inf}   # settled -> ends anyway;
                                                       # wide is only a clearance via point; standoff next to the box
                                                       # far off = blocked -> keep waiting
 GRAV_MAX_RAD = 0.3        # cap on the gravity-compensation offset per joint
-LOAD_RAMP_S = 1.0         # box-weight compensation fades in over this time from the start of carry
+LOAD_RAMP_S = 1.0         # box-weight compensation fades in from the start of carry / out during unload
 
 SIM_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE,
                      history=HistoryPolicy.KEEP_ALL)
@@ -219,6 +247,9 @@ class PickupSequencer(Node):
                 self.get_logger().warning(f"Gravity compensation OFF - cannot read kp from {args.io}: {e}")
         self.settle_ref = None             # (time, measured hand positions) for the settled check
         self.load_t0 = None                # time carry started (box-weight compensation ramp)
+        self.unload_t0 = None              # time unload started (ramp back out)
+        self.place_requested = False
+        self.create_subscription(String, "/sequencer_cmd", self.cb_cmd, 10)
         self.flag_pub = self.create_publisher(Bool, "/load_expected", 10)
 
     def log(self, s, warn=False):
@@ -238,9 +269,10 @@ class PickupSequencer(Node):
         js = "/joint_states" + (f"+{self.a.imu_topic} (same stamp)" if self.a.clock == "stamp" else "")
         self.get_logger().info(f"Waiting for {js} and /target_pose_left/right ...")
         t0 = time.time()
-        while rclpy.ok() and (self.joint_state is None or None in self.targets.values()):
+        need_targets = not self.a.place_only
+        while rclpy.ok() and (self.joint_state is None or (need_targets and None in self.targets.values())):
             rclpy.spin_once(self, timeout_sec=0.1)
-            if time.time() - t0 > WAIT_TIMEOUT_S:
+            if time.time() - t0 > WAIT_TIMEOUT_S and not self.a.place_only:   # --place-only: started before Play
                 missing = [n for n, v in [(js, self.joint_state), ("/target_pose_left", self.targets["L"]),
                                           ("/target_pose_right", self.targets["R"])] if v is None]
                 raise RuntimeError(f"Timed out waiting for {missing} (ROS_DOMAIN_ID? sim playing?)")
@@ -279,6 +311,16 @@ class PickupSequencer(Node):
         if (self.started and self.name in RETRY and arm.failed and not arm.busy     # rejected arm (holds still):
                 and moved(arm.rejected_for, pose, self.a.replan_mm / 1000, self.a.replan_deg)):   # retry once it moved
             self.start_plan(arm)
+
+    def cb_cmd(self, msg):
+        if msg.data != "place":
+            return
+        if self.started and self.name == "hold":
+            self.place_requested = True
+            self.log("/sequencer_cmd place -> placing the box (balance controller in control?)")
+        else:
+            self.log(f"/sequencer_cmd place ignored in phase '{self.name if self.started else 'not started'}' "
+                     "(only from hold)", warn=True)
 
     def replan_moved_targets(self, now):
         """Live phases: replan an arm whose target moved, but only once its current move has finished."""
@@ -331,11 +373,10 @@ class PickupSequencer(Node):
         self.log(f"{arm.side} carry: grip width {w * 100:.1f} cm (CARRY_POSE: {np.linalg.norm(pl - pr) * 100:.1f} cm)")
         return (pl + pr) / 2 + arm.sign * w / 2 * u, (Rl if arm.side == "L" else Rr), qp[arm.q_idx]
 
-    def carry_path(self, data, arm, q):
-        """Straight Cartesian line (orientation slerped) to carry_target, IK at CARRY_STEPS knots, each
-        seeded on the joint-space line to CARRY_POSE (keeps the path continuous, ends at CARRY_POSE when
-        the grip width matches). Returns (ik result of the last knot, as ik(), pos, rot, knots (n+1, 7))."""
-        pos, rot, q_pose = self.carry_target(data, q, arm)
+    def line_path(self, data, arm, q, pos, rot, q_end=None):
+        """Straight Cartesian line (orientation slerped) to (pos, rot), IK at CARRY_STEPS knots. Each knot
+        is seeded on the joint-space line to q_end (carry: ends at CARRY_POSE when the grip width matches)
+        or, without q_end, at the previous knot. Returns (ik result of the last knot, as ik(), knots (n+1, 7))."""
         q0 = q[arm.q_idx].copy()
         p0, R0 = self.fk(data, q, arm.ee)
         slerp = Slerp([0, 1], Rotation.from_matrix(np.stack([R0, rot])))
@@ -343,12 +384,12 @@ class PickupSequencer(Node):
         for k in range(1, CARRY_STEPS + 1):
             f = k / CARRY_STEPS
             qs = q.copy()
-            qs[arm.q_idx] = q0 + f * (q_pose - q0)
+            qs[arm.q_idx] = q0 + f * (q_end - q0) if q_end is not None else knots[-1]
             res = self.ik(data, arm, qs, p0 + f * (pos - p0), slerp(f).as_matrix())
             if res is None or res == "reject":
-                return res, pos, rot, None
+                return res, None
             knots.append(res[0])
-        return res, pos, rot, np.array(knots)
+        return res, np.array(knots)
 
     def out_dir(self):
         """Unit vector right target -> left target, horizontal."""
@@ -403,11 +444,37 @@ class PickupSequencer(Node):
             return p - (GRASP_REACH_M + self.a.squeeze) * out, np.eye(3)
         return None     # carry: from the post-tilt pose, in the thread
 
+    def place_goal(self, arm):
+        """lower / release / retract goal from the CURRENT commanded hands (the box targets are long stale)."""
+        q = self.base_q()
+        (pl, Rl), (pr, Rr) = self.fk(self.data, q, self.arms[0].ee), self.fk(self.data, q, self.arms[1].ee)
+        p, R = (pl, Rl) if arm.side == "L" else (pr, Rr)
+        if self.name == "lower":     # midpoint to place_z above the pelvis, both hands by the same offset
+            dz = self.a.place_z - (pl[2] + pr[2]) / 2
+            if arm.side == "L":
+                self.log(f"lower: box {-dz * 100:+.1f} cm down, {self.a.place_dx * 100:+.1f} cm forward "
+                         f"(hands to z {self.a.place_z:+.2f} m in the pelvis frame)", warn=dz > 0)
+            return p + [self.a.place_dx, 0.0, dz], R
+        u = (pl - pr) * [1, 1, 0]
+        u /= np.linalg.norm(u)
+        if self.name == "grip":      # squeeze: hands in by --squeeze (they rest on the box sides now)
+            return p - arm.sign * self.a.squeeze * u, R
+        if self.name == "release":   # straight out along the grip axis, the pinch reversed
+            return p + arm.sign * (GRASP_REACH_M + self.a.squeeze) * u, R
+        return np.array(self.a.wide) * [1.0, arm.sign, 1.0], None   # retract: wide pose, orientation free
+
     def start_plan(self, arm):
         arm.cancel.set()
         if arm.thread and arm.thread.is_alive():
             arm.thread.join(timeout=0.2)
         arm.cancel.clear()
+        if self.name == "unload":   # arms still; the load compensation ramps out (load_factor)
+            self.commit(arm, arm.q_to.copy(), arm.goal, LOAD_RAMP_S)
+            return
+        if self.name == "home":     # joint space to the policies' arm defaults
+            self.commit(arm, np.array([HOME_POSE_DICT[n] for n in arm.names]), None)
+            self.log(f"{arm.side} home: move {arm.dur:.2f}s")
+            return
         if self.name == "tilt":     # joint space, no IK
             q = arm.q_to.copy()
             for i, deg in ((WRIST_PITCH_IDX, self.a.tilt_wrist), (ELBOW_IDX, self.a.tilt_elbow)):
@@ -419,15 +486,19 @@ class PickupSequencer(Node):
             return
         arm.planned_for = self.targets[arm.side]
         arm.busy = True
-        arm.thread = threading.Thread(target=self.plan, args=(arm, self.name, self.base_q(), self.phase_goal(arm)),
-                                      daemon=True)
+        goal = self.place_goal(arm) if self.phase > PHASES.index("hold") else self.phase_goal(arm)
+        arm.thread = threading.Thread(target=self.plan, args=(arm, self.name, self.base_q(), goal), daemon=True)
         arm.thread.start()
 
     def plan(self, arm, name, q, goal):
         """IK thread (like H2_ik_node): solve, then hand the result to tick() via commit()."""
         data = self.model.createData()
         if name == "carry":
-            res, pos, rot, knots = self.carry_path(data, arm, q)
+            pos, rot, q_end = self.carry_target(data, q, arm)
+            res, knots = self.line_path(data, arm, q, pos, rot, q_end)
+        elif name in PATHS:
+            (pos, rot), knots = goal, None
+            res, knots = self.line_path(data, arm, q, pos, rot)
         else:
             (pos, rot), knots = goal, None
             res = self.ik(data, arm, q, pos, rot)
@@ -439,7 +510,8 @@ class PickupSequencer(Node):
             arm.failed, arm.busy, arm.rejected_for, arm.planned_for = True, False, arm.planned_for, None
             return
         q_arm, e_pos, e_rot = res
-        self.commit(arm, q_arm, (pos, rot), self.a.pinch_time if name == "pinch" else MIN_MOVE_S, knots)
+        self.commit(arm, q_arm, (pos, rot), {"pinch": self.a.pinch_time, "lower": self.a.place_time}.get(name, MIN_MOVE_S),
+                    knots)
         if name == "carry":
             pose = np.array([CARRY_POSE_DICT[n] for n in arm.names])
             self.log(f"{arm.side} carry: ends max {np.degrees(np.abs(q_arm - pose)).max():.1f} deg from CARRY_POSE")
@@ -465,6 +537,16 @@ class PickupSequencer(Node):
             arm.q_cmd = np.array([meas[n] for n in arm.names])
         self.now = self.t_start = stamp_s(self.joint_state) if self.a.clock == "stamp" else time.monotonic()
         self.started = True
+        if self.a.place_only:      # holding the box already: full load from the start, then grip
+            self.phase = PHASES.index("grip")
+            self.load_t0 = self.now - LOAD_RAMP_S
+            self.log(f"--place-only: box weight {self.a.box_mass:.1f} kg compensated from the start")
+            self.log(f"-> phase {self.phase + 1}: {self.name}")
+            for arm in self.arms:
+                self.start_plan(arm)
+            if self.a.clock == "wall":
+                self.create_timer(1.0 / CONTROL_HZ, lambda: self.tick(time.monotonic()))
+            return
         self.log(f"targets in frame '{self.target_frame}'")
         for side, (p, R) in self.targets.items():
             self.log(f"{side} target pos {p.round(3)} | rpy {Rotation.from_matrix(R).as_euler('xyz', degrees=True).round(1)} deg")
@@ -516,6 +598,8 @@ class PickupSequencer(Node):
         """0 before carry, then ramps 0 -> 1 over LOAD_RAMP_S: share of the box weight compensated."""
         if self.phase < PHASES.index("carry") or self.load_t0 is None:
             return 0.0
+        if self.unload_t0 is not None:     # unload and after: ramp back out
+            return float(np.clip(1.0 - (self.now - self.unload_t0) / LOAD_RAMP_S, 0.0, 1.0))
         return float(np.clip((self.now - self.load_t0) / LOAD_RAMP_S, 0.0, 1.0))
 
     def gravity_offset(self):
@@ -550,6 +634,26 @@ class PickupSequencer(Node):
             self.settle_ref = (now, pos)
         return now - self.settle_ref[0] >= SETTLE_S
 
+    def advance(self, now):
+        self.phase += 1
+        if self.name == "grip":            # after a pickup the grip is already squeezed
+            self.phase += 1
+        self.log(f"-> phase {self.phase + 1}: {self.name}" + ("  | load_expected -> True" if self.name == "carry" else ""))
+        if self.name == "carry":
+            self.load_t0 = now
+            if self.kp is not None and self.a.box_mass > 0:
+                self.log(f"box weight compensation: {self.a.box_mass:.1f} kg ({self.a.box_mass / 2:.1f} kg per hand), "
+                         f"fading in over {LOAD_RAMP_S:.1f}s")
+        if self.name == "unload":
+            self.unload_t0 = now
+            self.log(f"box weight compensation fading out over {LOAD_RAMP_S:.1f}s")
+        if self.name == "done":
+            self.log("placed, arms home - hand over to the no-box walking controller")
+        if self.name not in WAIT:
+            self.done_t = None
+            for arm in self.arms:
+                self.start_plan(arm)
+
     def joints_off(self):
         """Joints > 0.05 rad from the command: planned cmd, value sent (with gravity comp), measured,
         gravity torque the pose needs (model) and the torque the sim reports (/joint_states effort)."""
@@ -570,7 +674,10 @@ class PickupSequencer(Node):
         return "; ".join(out) or "none > 0.05 rad"
 
     def step_phase(self, now):
-        if self.name == "hold":
+        if self.name == "done" or (self.name == "hold" and not self.place_requested):
+            return
+        if self.name == "hold":            # place requested: start phase 7 straight away
+            self.advance(now)
             return
         if not all(not a.busy and not a.failed and a.q_to is not None and a.t0 is not None and now - a.t0 >= a.dur
                    for a in self.arms):     # a rejected arm still holds its previous move -> not done
@@ -593,17 +700,7 @@ class PickupSequencer(Node):
             why = "" if reached else (" - settled short of the command, moving on" if still else " - not reached, moving on (contact)")
             self.log(f"{self.name} done: hands vs command L {el:.0f} mm, R {er:.0f} mm"
                      + (f"{why}. Joints off: {self.joints_off()}" if why else ""), warn=bool(why))
-            self.phase += 1
-            self.log(f"-> phase {self.phase + 1}: {self.name}" + ("  | load_expected -> True" if self.name == "carry" else ""))
-            if self.name == "carry":
-                self.load_t0 = now
-                if self.kp is not None and self.a.box_mass > 0:
-                    self.log(f"box weight compensation: {self.a.box_mass:.1f} kg ({self.a.box_mass / 2:.1f} kg per hand), "
-                             f"fading in over {LOAD_RAMP_S:.1f}s")
-            if self.name != "hold":
-                self.done_t = None
-                for arm in self.arms:
-                    self.start_plan(arm)
+            self.advance(now)
         elif now - self.warn_t > WARN_EVERY_S:
             self.warn_t = now
             self.log(f"{self.name}: waiting for hands (L {el:.0f} mm, R {er:.0f} mm > {self.a.tol * 1000:.0f} mm). "
@@ -633,6 +730,13 @@ def main():
                    help="raise arm targets by tau_gravity/kp so the hands do not sag (--no-gravity-comp to disable)")
     p.add_argument("--box-mass", type=float, default=7.0,
                    help="box weight compensated from the start of carry (kg, split over both hands; 0 = off)")
+    p.add_argument("--place-only", action="store_true",
+                   help="start at the place with the robot already holding the box (grip, lower, ... home); "
+                        "start it BEFORE Play, with the balance controller, so the arms never get the policy's default")
+    p.add_argument("--place-z", type=float, default=0.10,
+                   help="lower: hand midpoint height above the pelvis to put the box down at (m)")
+    p.add_argument("--place-dx", type=float, default=0.0, help="lower: also move the box this far forward (m)")
+    p.add_argument("--place-time", type=float, default=2.0, help="lower: minimum duration of the move down (s)")
     p.add_argument("--io", default=POLICY_IO, help="policy_io.json with the joint stiffness (kp) used in the sim")
     p.add_argument("--waist", choices=["measured", "zero"], default="measured",
                    help="waist in the IK model: measured (targets are in the live pelvis frame) or zero (H2_ik_node, pinned torso)")
