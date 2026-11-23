@@ -3,7 +3,7 @@
 `nodes/navigation/h2_arrival_navigator.py`, a sibling of `h2_local_navigator.py` (same services, `cmd_vel`,
 `head_pitch_cmd`, velocity shaping, `[CMD]`/`[HB]` logs). The robot comes in along the table's **bisector** (the line
 through the table centre, normal to its long side), **stops to latch** the table pose 1.7 to 2.0 m from the face, and
-walks the last stretch **straight in on odometry** to the table face (`place_standoff` 0.07), because the camera is blocked near the table
+walks the last stretch **straight in on odometry** to the table face (`place_standoff` 0.10), because the camera is blocked near the table
 (box in the hands, table filling the view). The table is tracked in a **fixed frame**.
 
 ```
@@ -34,8 +34,9 @@ SCAN ─► ROTATE/APPROACH leg "meet"  ──(within 0.4 m of the bisector)─�
    pursuit), so the path melts into the line and arrives on it, instead of meeting it only at the end point. A robot that
    starts on the bisector skips the meet leg.
 4. **Latch** at a real distance to the face ≤ `latch_far` (2.0 m), see below.
-5. **Straight in** on the frozen table and the pelvis pose from TF to `place_standoff` (0.07 m, pelvis 7 cm from the face line), then
-   FINAL_ALIGN: yaw first, then x/y creep (±5 cm, ±4°), 20 settled cycles, `succeeded`.
+5. **Straight in** on the frozen table and the pelvis pose from TF to `place_standoff` (0.10 m, pelvis 10 cm from the face line), then
+   FINAL_ALIGN: yaw first, then x/y creep (±5 cm, ±4°), 20 settled cycles, `succeeded`. If the table stops the body first, the
+   blocked check below ends it.
 
 **Between phases** the robot stands still for `phase_pause_s` (1 s sim time; the sim runs at ~0.22 real time, so it is
 about 4.5 s on the wall clock).
@@ -98,6 +99,20 @@ stopped scanning on them, walked on a frozen wrong estimate and lost the table.
    `unmerge_tol` (0.8 m) off the bisector sends it back to the meet leg (`[LEG] ... meet leg again`) instead of
    keeping the old "on the line" state.
 
+## When the table stops the body (blocked check)
+
+Nov 23, afternoon: the robot stood against the table at 0.14 to 0.18 m from the face and kept commanding `vx=0.17` for
+63 s of sim time, 4 cm short of the ±5 cm tolerance, until the 180 s run timeout. After the latch, whenever the node
+commands a translation (APPROACH, FINAL pos) it measures the distance to the goal. If the robot has pushed for `block_s`
+(4 s, only the time spent pushing counts, not yaw turns or pauses) without getting `block_progress` (3 cm) closer:
+
+- within `block_accept` (10 cm) of the goal in x, ±10 cm in y and ±8° in yaw: **`succeeded` with a warning** (`[BLOCKED] ...
+  accepting this pose`), and the result carries `"blocked": true` and `goal_error_m` (how far short);
+- anywhere else: **fail at once**: `blocked: pushing for 4s without getting closer: 0.40 m from the goal (...)`.
+
+The check is off before the latch (the estimate still moves then) and resets at every phase change. A healthy creep at
+`v_min` 0.17 m/s covers 0.7 m in 4 s, so a robot that is moving never trips it.
+
 ## Run
 
 Needs `/active_target` = `workstation` (the visualizer then publishes `/workstation_pose`) and a TF **fixed frame to
@@ -127,7 +142,7 @@ ros2 service call /h2_arrival_navigator/cancel std_srvs/srv/Trigger
 ```
 Floats need a decimal point (`-p latch_far:=2.0`). `-p log_poses:=true` prints every accepted pose in odom coordinates.
 Log landmarks: `[SCAN] table found`, `[LEG] on the bisector`, `[LATCH] try 1 … standing still`, `[LATCH] table at odom …`,
-`[PHASE]`, `[DONE]`; new: `[VIEW]` (pose ignored, table at the image edge), `[SCAN] table found ... centre X deg off the camera axis`, `[LOST]`, `[LEG] ... meet leg again`.
+`[PHASE]`, `[DONE]`; new: `[VIEW]` (pose ignored, table at the image edge), `[SCAN] table found ... centre X deg off the camera axis`, `[LOST]`, `[LEG] ... meet leg again`, `[BLOCKED]`.
 
 **Start the robot with the table in view and at least ~2.5 m from its face** (the meet point is 3.0 m out). A start inside
 the window and on the bisector latches where it stands, with a warning. A start inside the window and off the bisector
@@ -146,7 +161,8 @@ ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{}"
 | parameter | default | note |
 |---|---|---|
 | `odom_frame` | `odom` | the fixed frame in TF: **`world` in Isaac Sim** (pass `-p odom_frame:=world`) |
-| `place_standoff` | 0.07 | pelvis → table near face at the end (was 0.20, then 0.0). The carry pose of `H2_pickup_sequencer` puts the box front 0.35 m ahead of the pelvis, so **the box ends 0.28 m over the table**: the carry height must clear the table top (1.05 m), and the estimate error (a few cm, up to ~0.1 m seen) can push the robot into the table. If it touches, `-p place_standoff:=0.12` |
+| `place_standoff` | 0.10 | pelvis → table near face at the end (was 0.20, 0.0, 0.07). The carry pose of `H2_pickup_sequencer` puts the box front 0.35 m ahead of the pelvis, so **the box ends 0.25 m over the table**: the carry height must clear the table top (1.05 m). **The body is stopped by the table at about 0.15 m from the face** (Nov 23), so any standoff below that ends in the blocked check, with a warning. 0.15 would stop exactly there without pushing |
+| `block_s`, `block_progress`, `block_accept` | 4.0, 0.03, 0.10 | blocked check (above): s of pushing, m of progress that resets it, m from the goal within which a blocked stop counts as success |
 | `lateral_offset` | 0.0 | stand this far to the robot's **left** of the table centre (the bisector moves with it) |
 | `meet_dist` | 3.0 | m, meet point on the bisector, from the face. Keep it above `latch_far` |
 | `line_tol` | 0.4 | m, this close to the bisector counts as on it (also the warning limit at the latch) |
@@ -188,10 +204,10 @@ success carries `face_dist_m` (pelvis → table face, what the place step needs)
 
 ## Tests
 
-`pytest tests` (106 in all; 60 in `tests/navigation`, no ROS needed). They drive the node in a small kinematic world
+`pytest tests` (110 in all; 64 in `tests/navigation`, no ROS needed). They drive the node in a small kinematic world
 (`navsim.py`): velocity lag 0.25 s, vision 0.3 s late and noisy, camera blind below 1.2 m, tracker gaps, 180° flips,
 a re-estimation jump inside the latch window, odometry loss, partial-view errors at the image edge (`edge=`), a limited
-vision range (`vision_range=`). They check arrival within 8 cm / 6° of the goal (10 cm / 7°
+vision range (`vision_range=`), a table that stops the body (`wall=`: the pelvis cannot get closer than this to the face). They check arrival within 8 cm / 6° of the goal (10 cm / 7°
 for the noisy and sideways cases), and the new approach: from beside the table's end the robot meets the bisector more
 than 2 m out, faces the table, latches on the line (within 0.2 m) and walks straight in; a table seen end-on is passed on
 the outside and approached at a long face; a start on the bisector does not detour; a start in the window latches where it
@@ -202,14 +218,17 @@ velocity for the whole pause after every phase change. For Nov 23: SCAN does not
 image edge are ignored while the robot walks with the table off to the side, a start beside the table with partial-view
 errors succeeds with the gate and fails without it, the robot stands still when the table should be in view but no pose
 comes (and fails with the reason if it does not come back), a corrected estimate after merging sends it back to the meet
-leg, and a wrong estimate with the real table visible off the axis is corrected instead of deadlocking.
+leg, and a wrong estimate with the real table visible off the axis is corrected instead of deadlocking. For the blocked
+check: stopped 7 cm short of the end point it succeeds with a warning and `blocked: true`; stopped 0.5 m short, or 13 cm
+short inside final_align, it fails at once with the reason; a wall behind the end point is not reported as blocked.
 Deliberate breakages of the node were all caught by a test: 20 on the first version (image-time TF, the settle rule, the
 retry, the axis average, the head formula, the stop, the signal handling, …) and 17 on the bisector approach (plane
 distance as range, no on-the-line condition in the trigger, no turn before the latch, no meet leg, meet point inside the
 window, no side memory, no lookahead, no bearing fade, no guard against success without a latch, a latch timeout that
 ignores the turn, …) and 8 on the view guard (no view gate, SCAN stopping at the first 3 poses, no lost guard, a lost guard
 that also fires when the table is out of view on purpose, turning to the estimate only, no turn to ignored poses in the
-latch, no unmerge, a lost guard that never gives up).
+latch, no unmerge, a lost guard that never gives up) and 5 on the blocked check (no check, accepting at any distance, the progress never resetting
+the push time, the check also before the latch, success without the `blocked` flag).
 
 ## Runs so far
 
@@ -228,8 +247,13 @@ latch, no unmerge, a lost guard that never gives up).
   and the real table was visible off the axis (corrections gated out), so SCAN, LOST and LATCH turn towards the newest
   pose, accepted or ignored.
 
+- **Fourth run (Nov 23, afternoon).** Arrived at the table with `place_standoff` 0.07 and stood at 0.14 to 0.18 m from the
+  face (median 0.16), blocked by the table (seen in the sim). `final_align` kept pushing, with a ±4° yaw wobble and ±5 cm
+  lateral sway from the stepping, until the run timeout: the goal was 9 cm ahead, the tolerance ±5 cm. Fixed by standoff
+  0.10 plus the blocked check; the 0.15 m is where the table stops the body, so the end now counts as reached when blocked.
+
 **Not verified** (no ROS, GPU or robot here): real tracker noise and lag, whether 10 m of `max_depth` fixes the axis,
-how the free-box policy follows `cmd_vel` with the head tilted, the carry height and any contact with the table at the 0.07 end, how the policy follows the 0.65 rad/s minimum turn rate (hunting in FINAL_ALIGN, yaw tolerance 4°), the real tracker behaviour at the view limit, the real pose-age distribution behind `stale_pose_s`, and `main()` on a real
+how the free-box policy follows `cmd_vel` with the head tilted, the carry height over the table (the box front ends 0.25 m over it), what exactly touches the table at 0.15 m (box, hands or feet: not looked at), how the policy follows the 0.65 rad/s minimum turn rate (hunting in FINAL_ALIGN, yaw tolerance 4°), the real tracker behaviour at the view limit, the real pose-age distribution behind `stale_pose_s`, and `main()` on a real
 rclpy (its signal handling follows the rclpy source and is tested on a stub). The table's pose along its long axis can
 be off by ~0.3 m between FoundationPose estimations; this node cannot fix that, it only keeps the robot from chasing it.
 Known limit: no path planning around the table; the meet leg is a straight line, safe for a robot in front of a long

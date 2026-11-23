@@ -20,7 +20,9 @@ table's BISECTOR, the line through the table centre normal to its long side:
   ROTATE, APPROACH, FINAL_ALIGN
                    on the frozen table and the pelvis pose from TF (odometry): straight in along the bisector to
                    place_standoff from the table face, square to it. Vision is ignored from the latch on (the live
-                   pose is only logged, next to the latched one)
+                   pose is only logged, next to the latched one). If it pushes for block_s without getting closer
+                   (the table stops the body), within block_accept of the end point it succeeds with a warning
+                   (result "blocked": true), anywhere else it fails at once with the reason
 
 Only poses with the table centre close enough to the camera axis that the whole table fits the image count
 (view_limit); while it is further off the estimate stays frozen and the robot walks on odometry. If the table
@@ -69,8 +71,9 @@ PARAMS = dict(
     # table (size from targets.yaml) and where to stand
     table_depth=0.762,          # m, short side (mesh X)
     table_length=2.474,         # m, long side (mesh Y)
-    place_standoff=0.07,        # m, pelvis -> table near face at the end. The carry pose of H2_pickup_sequencer holds the box
-                                #    front 0.35 m ahead of the pelvis (grip x 0.20 + half the 0.30 m box): 0.28 m over the table at 0.07
+    place_standoff=0.10,        # m, pelvis -> table near face at the end. The carry pose of H2_pickup_sequencer holds the box
+                                #    front 0.35 m ahead of the pelvis (grip x 0.20 + half the 0.30 m box): 0.25 m over the table at 0.10.
+                                #    The body is stopped by the table at about 0.15 m (Nov 23 run, see block_*)
     lateral_offset=0.0,         # m, stand this far to the robot's LEFT of the table centre (the bisector moves with it)
     # approach: meet the bisector, then walk in along it
     meet_dist=3.0,              # m, meet point on the bisector, from the near face (keep it above latch_far)
@@ -96,6 +99,9 @@ PARAMS = dict(
     stale_pose_s=1.5,           # s without a pose although the table should be in view: stand still ...
     lost_timeout_s=12.0,        # s ... and fail after this long
     unmerge_tol=0.8,            # m, off the bisector by more than this (a corrected estimate): meet leg again
+    # blocked: after the latch the robot pushes (cmd_vx/vy) for block_s without getting block_progress closer to the goal
+    # (the table is in the way): FINAL within block_accept of the goal -> succeeded with a warning, anywhere else -> fail
+    block_s=4.0, block_progress=0.03, block_accept=0.10,
     # pose sanity
     max_range=9.0, min_horizontal_y=0.20,
     # motion: same names and defaults as h2_local_navigator (tuned there for the no-box policy)
@@ -197,6 +203,7 @@ class H2ArrivalNavigator(Node):
         self.live, self.face_yaw = None, 0.0       # newest pose after the latch (logged only) / heading (odom) that faces the table
         self.t_start = self.t_latch = self.latch_t0 = self.lost_since = self.side_since = self.yaw_prev = None
         self.side_pause_until, self.settle, self.scanned = 0.0, 0, 0.0
+        self.push_prev, self.push_best, self.push_s = None, math.inf, 0.0   # blocked check: last push time / closest to the goal / s pushing since
         self.head_target = self.head_cmd = self.head_err = None
         self.last_cmd, self.last_hb = (0.0, 0.0, 0.0), None
         self.n_rx = self.n_acc = self.n_rej = self.n_tf_fail = self.n_edge = 0
@@ -569,8 +576,34 @@ class H2ArrivalNavigator(Node):
                 vx = shape(tx, p.kp_lin, p.v_min, p.v_max, p.pos_tol)
                 vy = self.gate_sidestep(shape(ty, p.kp_lin, p.v_min, p.v_max, p.pos_tol), now)
                 why = f'final_align pos: dx={tx:.3f} dy={ty:.3f}'
+        if self.latched and (vx or vy):                              # pushing on odometry: is the robot getting anywhere?
+            if self.pushing(now, dist):
+                return self.blocked(r, g, dist)
+        else:
+            self.push_prev = None
         self.publish_cmd(vx, vy, wz, why)
         self.heartbeat(r, g)
+
+    def pushing(self, now, dist):
+        """True when the robot has pushed for block_s without getting block_progress closer to the goal."""
+        p = self.p
+        dt = min(now - self.push_prev, 0.5) if self.push_prev is not None else 0.0
+        self.push_prev = now
+        if dist < self.push_best - p.block_progress:
+            self.push_best, self.push_s = dist, 0.0
+        else:
+            self.push_s += dt
+        return self.push_s >= p.block_s
+
+    def blocked(self, r, g, dist):
+        p = self.p
+        why = (f'pushing for {p.block_s:.0f}s without getting closer: {dist:.2f} m from the goal (dx={g.tx:.3f} dy={g.ty:.3f} '
+               f'dyaw={math.degrees(g.eyaw):.1f} deg), pelvis {g.rng:.2f} m from the table face')
+        if abs(g.tx) <= p.block_accept and abs(g.ty) <= 2 * p.pos_tol and abs(g.eyaw) <= 2 * p.yaw_tol:
+            self.get_logger().warn(f'[BLOCKED] {why} -> something stops the robot (the table?): accepting this pose')
+            return self.succeed(r, g, blocked=True)
+        self.fail(f'blocked: {why} (more than {p.block_accept} m from the goal, or not squared up: the table or something else '
+                  f'is in the way, or the robot does not follow vx)')
 
     def scan_step(self, now, r):
         p = self.p
@@ -675,7 +708,7 @@ class H2ArrivalNavigator(Node):
                                f'{math.degrees(dy):.1f} deg -> vision ignored, walking on odometry')
         self.set_phase(Phase.ROTATE)
 
-    def succeed(self, r, g):
+    def succeed(self, r, g, blocked=False):
         self.publish_cmd(0.0, 0.0, 0.0, 'succeeded')
         c = np.array(self.est[:2]) - r[:2]
         co, si = math.cos(r[2]), math.sin(r[2])
@@ -683,6 +716,8 @@ class H2ArrivalNavigator(Node):
                       table_in_pelvis_m=[round(float(co * c[0] + si * c[1]), 4), round(float(-si * c[0] + co * c[1]), 4)],
                       goal_error_m=[round(g.tx, 4), round(g.ty, 4)], **self.latch_info,
                       head_pitch_deg=None if self.head_cmd is None else round(math.degrees(self.head_cmd), 2))
+        if blocked:
+            result['blocked'] = True                         # stopped by the table, not by reaching the goal: goal_error_m says how far short
         self.set_phase(Phase.DONE)
         self.publish_result(result)
         if not self.p.head_hold_after_done:
@@ -746,6 +781,7 @@ class H2ArrivalNavigator(Node):
             self.get_logger().info(f'Phase -> {phase.value}')
             self.phase = phase
             self.settle = 0
+            self.push_prev, self.push_best, self.push_s = None, math.inf, 0.0
             if phase in RUNNING and phase is not Phase.SCAN and self.p.phase_pause_s > 0:
                 self.pause_until = self.now() + self.p.phase_pause_s
             self.publish_status()

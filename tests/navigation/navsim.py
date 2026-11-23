@@ -60,12 +60,13 @@ class FakeTF:
 class Sim:
     def __init__(self, node, robot=(0.0, 0.0, 0.0), table=(3.8, 0.0, math.pi / 2), *, latency=0.3, vision_hz=10.0,
                  sigma=(0.02, math.radians(1.0)), tau=0.25, blocked_below=1.2, fov=math.radians(41), gaps=None,
-                 flip_prob=0.0, seed=0, dt=0.05, vision_range=5.0, edge=None):
+                 flip_prob=0.0, seed=0, dt=0.05, vision_range=5.0, edge=None, wall=None):
         self.node, self.dt, self.tau, self.latency = node, dt, tau, latency
         self.table, self.sigma, self.blocked_below, self.fov = table, sigma, blocked_below, fov
         self.gaps, self.flip_prob, self.rng = gaps, flip_prob, np.random.default_rng(seed)
         self.vision_period = 1.0 / vision_hz
         self.vision_range, self.edge = vision_range, edge       # edge = (deg, shift m, yaw error rad): a table centre further off the axis is only partly in the image: its pose is shifted toward the axis and its axis is wrong
+        self.wall = wall                                        # the table stops the body: the pelvis cannot get closer than this to the near face
         self.x, self.y, self.yaw = robot
         self.v, self.t, self.next_vision = np.zeros(3), 0.0, 0.0
         self.tf = node.tf_buffer = FakeTF()
@@ -144,8 +145,11 @@ class Sim:
         u = np.zeros(3) if cmd is None else np.array([cmd.linear.x, cmd.linear.y, cmd.angular.z])
         self.v += (u - self.v) * (1 - math.exp(-self.dt / self.tau))
         c, s = math.cos(self.yaw), math.sin(self.yaw)
+        x0, y0 = self.x, self.y
         self.x += (c * self.v[0] - s * self.v[1]) * self.dt
         self.y += (s * self.v[0] + c * self.v[1]) * self.dt
+        if self.wall is not None and self.true_errors()[3] < self.wall and self.true_errors()[3] < self.true_errors((x0, y0, self.yaw))[3]:
+            self.x, self.y = x0, y0                           # blocked: the feet keep stepping, the body stays
         self.yaw += self.v[2] * self.dt
         self.t += self.dt
         self._record()

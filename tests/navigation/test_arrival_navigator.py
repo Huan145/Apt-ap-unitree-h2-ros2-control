@@ -331,7 +331,8 @@ def test_walks_in_latches_in_the_window_and_arrives_on_odometry_with_the_camera_
     n, sim, marks, phase = run_nominal()
     assert phase == 'succeeded'
     dx, dy, dyaw, face = sim.true_errors()
-    assert STANDOFF == 0.07                                                                  # the end: 7 cm pelvis -> table face
+    assert STANDOFF == 0.10                                                                  # the end: 10 cm pelvis -> table face
+    assert 'blocked' not in result(n)
     assert math.hypot(dx, dy) < 0.08 and abs(dyaw) < math.radians(6) and face == pytest.approx(STANDOFF, abs=0.08)
     info = result(n)
     assert 1.7 - 0.15 <= info['latched_range_m'] <= 2.0 + 0.15 and info['latch_tries'] == 1
@@ -686,3 +687,35 @@ def test_scan_stands_still_until_the_poses_are_settled_not_after_the_first_three
     assert n.phase is nav.Phase.SCAN and cmd(n)[2] == 0.0              # the table is in view: stand still and wait
     sim.run(until=lambda s: n.phase is not nav.Phase.SCAN)
     assert n.phase is nav.Phase.ROTATE and len(n.samples) >= n.p.latch_samples
+
+
+def blocked_run(wall, **params):
+    n = make(**params)
+    sim = Sim(n, robot=(0.0, 0.0, 0.0), table=(3.8, 0.0, math.pi / 2), wall=wall)
+    start(n)
+    sim.run(limit=170.0)
+    return n, sim
+
+
+def test_a_table_that_stops_the_body_short_of_the_goal_ends_with_success_and_a_warning_not_a_timeout():
+    n, sim = blocked_run(wall=0.17)                          # the goal is 0.10 from the face: stopped 0.07 short (the Nov 23 run)
+    no_crash(n)
+    info = result(n)
+    assert n.phase.value == 'succeeded' and info['blocked'] is True and sim.t < 150.0
+    assert 0.05 < info['goal_error_m'][0] < 0.10 and n.log.has('warn', '[BLOCKED]')
+
+
+def test_blocked_far_from_the_goal_fails_at_once_with_the_reason():
+    n, sim = blocked_run(wall=0.6)                           # something in the way 0.5 m before the end point
+    assert n.phase.value == 'failed' and 'blocked' in result(n)['reason'] and sim.t < 150.0
+    assert 'from the goal' in result(n)['reason']
+
+
+def test_a_table_that_does_not_block_is_not_reported_as_blocked():
+    n, sim = blocked_run(wall=0.05)                          # the wall is behind the end point
+    assert n.phase.value == 'succeeded' and 'blocked' not in result(n)
+
+
+def test_blocked_in_the_last_stretch_but_more_than_10_cm_short_fails():
+    n, sim = blocked_run(wall=0.23)                          # final_align is entered, but the end point is 13 cm further
+    assert n.phase.value == 'failed' and 'blocked' in result(n)['reason'] and sim.t < 150.0
