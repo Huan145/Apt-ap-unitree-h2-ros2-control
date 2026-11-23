@@ -43,11 +43,18 @@ Put `targets.py`, `targets.yaml` and `target_switcher.py` on apt2 too. From `nod
 from further away is cut off. Add to the constants and to the parameters of **both** `foundationpose_node` and
 `foundationpose_tracking_node`:
 ```python
-MIN_DEPTH, MAX_DEPTH = 0.1, 4.0          # top of the file (floats, with the decimal point)
+MIN_DEPTH, MAX_DEPTH = 0.1, 10.0         # top of the file (floats, with the decimal point)
 ...
             'min_depth': MIN_DEPTH,
             'max_depth': MAX_DEPTH,
 ```
+Check after the relaunch (apt2, domain 0): `ros2 param get /foundationpose_tracking_node max_depth` must print 10.0.
+`max_depth` is a software threshold on the point cloud built from the depth image, not a camera limit (Isaac Sim
+renders exact depth far beyond it; a real stereo camera gets noisier with distance). **With 4.0 the second Nov 22 run saw only
+the nearest 0.5 to 0.8 m of the table from where the robot stood** (near end about 3.2 m deep, far end about 5.7 m), the
+long axis came out about 90 degrees off, and the robot ended at the table's short face. That is the best explanation,
+not a proven one: re-test with 10.0 and compare the axis the navigator latches (`[LATCH] ... axis`) with the table's
+Rotate Z in Isaac Sim.
 
 ## Workstation checklist
 
@@ -160,7 +167,7 @@ RGB + depth + mask ─► Selector ─┬─► ESTIMATION  from scratch: severa
   the tracker may keep the old mesh. Run the test below before relying on it. Fallback if it fails: the switcher
   restarts the FoundationPose launch with the other mesh (tens of seconds, hidden while the robot walks).
 - Not verified on the real system (no GPU/ROS in the sandbox): how long the first workstation detection takes,
-  and whether `MAX_DEPTH` 4.0 m is enough for a 2.5 m object seen from a distance (raise it if the far end is cut off).
+  and whether `MAX_DEPTH` 10.0 m fixes the table's long axis coming out 90 degrees off (it was 4.0 in the second Nov 22 run, see above).
 
 ## Tests
 

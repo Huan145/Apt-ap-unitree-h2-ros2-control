@@ -4,16 +4,21 @@ H2 Arrival Navigator: walk to the workstation (packing table) while carrying the
 
 Same interface as h2_local_navigator.py (Trigger services ~/start and ~/cancel, latched ~/status and
 ~/result, cmd_vel, head_pitch_cmd, same velocity shaping and debug logs), built for a table that the
-camera loses near the end of the walk (box in the hands, table filling the view):
+camera loses near the end of the walk (box in the hands, table filling the view). The robot comes in along the
+table's BISECTOR, the line through the table centre normal to its long side:
 
   SCAN             no table yet: stand still scan_wait_s, then turn slowly until poses arrive
-  ROTATE, APPROACH walk to the standoff point on the table estimate
-  LATCH            table face <= latch_far (2.0 m) ahead: STOP, wait latch_settle_s, take the poses stamped
-                   after the stop until they agree, freeze their median. The window latch_near..latch_far
-                   (1.7..2.0 m) is where the whole 2.47 m table still fits the 82 deg field of view
+  ROTATE, APPROACH leg "meet": walk to the meet point on the bisector, meet_dist (3.0 m) from the table face,
+                   steering by bearing only. Within line_tol (0.4 m) of the bisector: leg "line": turn to the table
+                   and walk in along the bisector (the aim point is the end point)
+  LATCH            on the bisector, face <= latch_far (2.0 m) away (real distance to the face, not to its plane):
+                   STOP, turn on the spot to face the table if needed, wait latch_settle_s, take the poses stamped
+                   after that until they agree, freeze their median. The window latch_near..latch_far (1.7..2.0 m)
+                   is where the whole 2.47 m table still fits the 82 deg field of view
   ROTATE, APPROACH, FINAL_ALIGN
-                   on the frozen table and the pelvis pose from TF (odometry): to place_standoff from the
-                   table face, square to it. Vision is ignored from the latch on
+                   on the frozen table and the pelvis pose from TF (odometry): straight in along the bisector to
+                   place_standoff from the table face, square to it. Vision is ignored from the latch on (the live
+                   pose is only logged, next to the latched one)
 
 The table is kept in a FIXED frame (odom_frame): every /workstation_pose is mapped with the pelvis pose at
 its image time, so a late or missing detection cannot bend the walk (the table does not move), and walking
@@ -57,9 +62,16 @@ PARAMS = dict(
     control_rate_hz=20.0,
     # table (size from targets.yaml) and where to stand
     table_depth=0.762,          # m, short side (mesh X)
-    place_standoff=0.50,        # m, pelvis -> table near face at the end. Placeholder: the carry pose of H2_pickup_sequencer
-                                #    holds the box front 0.35 m ahead of the pelvis (grip x 0.20 + half the 0.30 m box), + 0.15 m
-    lateral_offset=0.0,         # m, stand this far to the robot's LEFT of the table centre
+    table_length=2.474,         # m, long side (mesh Y)
+    place_standoff=0.20,        # m, pelvis -> table near face at the end. The carry pose of H2_pickup_sequencer holds the box
+                                #    front 0.35 m ahead of the pelvis (grip x 0.20 + half the 0.30 m box): 0.15 m over the edge
+    lateral_offset=0.0,         # m, stand this far to the robot's LEFT of the table centre (the bisector moves with it)
+    # approach: meet the bisector, then walk in along it
+    meet_dist=3.0,              # m, meet point on the bisector, from the near face (keep it above latch_far)
+    line_tol=0.4,               # m, this close to the bisector counts as on it: turn to the table and walk in
+    lookahead=1.0,              # m, on the bisector the aim point is this far up the line (pure pursuit): the path
+                                #    converges onto the line instead of meeting it only at the end point
+    aim_blend=0.6,              # m, closer than this to the aim point the bearing fades out (it is noise there)
     # latch
     latch_far=2.0, latch_near=1.7,   # m, pelvis -> table near face
     latch_tol=0.15,             # m, stationary range beyond latch_far + tol: walk on and latch again
@@ -71,7 +83,7 @@ PARAMS = dict(
     # scan
     scan_wait_s=3.0, scan_w=0.25, scan_dir=1.0, scan_max_deg=400.0, min_samples=3,
     # pose sanity
-    max_range=6.0, min_horizontal_y=0.20,
+    max_range=9.0, min_horizontal_y=0.20,
     # motion: same names and defaults as h2_local_navigator (tuned there for the no-box policy)
     v_min=0.17, v_max=0.50, w_min=0.25, w_max=0.50, kp_lin=1.0, kp_ang=1.5, kp_perp=0.6,
     sidestep_max_s=2.0, sidestep_pause_s=2.0,
@@ -166,6 +178,8 @@ class H2ArrivalNavigator(Node):
     def reset_run(self):
         self.samples = deque(maxlen=100)           # (image time, x, y, long-axis angle) in the odom frame
         self.est, self.latched, self.tries, self.latch_info = None, False, 0, {}
+        self.merged, self.n_ref = False, None      # reached the bisector / the table side (unit normal) chosen first
+        self.live, self.face_yaw = None, 0.0       # newest pose after the latch (logged only) / heading (odom) that faces the table
         self.t_start = self.t_latch = self.latch_t0 = self.lost_since = self.side_since = self.yaw_prev = None
         self.side_pause_until, self.settle, self.scanned = 0.0, 0, 0.0
         self.head_target = self.head_cmd = self.head_err = None
@@ -197,7 +211,7 @@ class H2ArrivalNavigator(Node):
 
     def on_pose(self, msg):
         self.n_rx += 1
-        if self.latched or self.phase not in (Phase.SCAN, Phase.ROTATE, Phase.APPROACH, Phase.LATCH):
+        if self.phase not in RUNNING:
             return
         t = stamp_s(msg.header.stamp)
         if self.phase is Phase.LATCH and t < self.latch_t0:
@@ -205,7 +219,7 @@ class H2ArrivalNavigator(Node):
         p, q = msg.pose.position, msg.pose.orientation
         v = (p.x, p.y, p.z, q.x, q.y, q.z, q.w)
         if not all(map(math.isfinite, v)) or np.linalg.norm(v[:3]) > self.p.max_range:
-            return self.reject('pose is NaN or further than max_range')
+            return None if self.latched else self.reject('pose is NaN or further than max_range')
         T_odom = self.tf(self.p.odom_frame, msg.header.frame_id, msg.header.stamp)
         if T_odom is None:
             self.n_tf_fail += 1
@@ -213,12 +227,16 @@ class H2ArrivalNavigator(Node):
         T = T_odom @ mat(p, q)                                       # table in the fixed frame
         u = T[:2, 1]                                                 # long axis (mesh Y), horizontal part
         if np.hypot(*u) < self.p.min_horizontal_y:
-            return self.reject('table long axis is vertical')
-        self.samples.append((t, T[0, 3], T[1, 3], math.atan2(u[1], u[0])))
+            return None if self.latched else self.reject('table long axis is vertical')
+        s = (t, float(T[0, 3]), float(T[1, 3]), math.atan2(u[1], u[0]))
+        if self.latched:
+            self.live = s                                            # logged next to the latched pose, never used
+            return
+        self.samples.append(s)
         self.n_acc += 1
         self.aim_head(msg, t)
         if self.p.log_poses:
-            self.get_logger().info(f'[POSE] odom ({T[0, 3]:.3f},{T[1, 3]:.3f}) axis {math.degrees(self.samples[-1][3]):+.1f} deg')
+            self.get_logger().info(f'[POSE] odom ({s[1]:.3f},{s[2]:.3f}) axis {math.degrees(s[3]):+.1f} deg')
 
     def reject(self, why):
         self.n_rej += 1
@@ -232,6 +250,12 @@ class H2ArrivalNavigator(Node):
     def estimate(self):
         return fuse(self.window()) if self.samples else None
 
+    @staticmethod
+    def drift(w):
+        """(m, rad) by which the median of the first half of the poses w differs from the second half's."""
+        a, b = fuse(w[:len(w) // 2]), fuse(w[len(w) // 2:])
+        return math.hypot(a[0] - b[0], a[1] - b[1]), abs(0.5 * wrap(2 * (a[2] - b[2])))
+
     def stable(self):
         """(estimate, drift m, drift rad, n) once the poses since the stop cover window_s, are enough and the first
         and second half of the window agree. A jump (new estimation) or drift pulls one median away from the other;
@@ -241,24 +265,51 @@ class H2ArrivalNavigator(Node):
         w = self.window()
         if len(w) < self.p.latch_samples:
             return None
-        a, b = fuse(w[:len(w) // 2]), fuse(w[len(w) // 2:])
-        dp, dy = math.hypot(a[0] - b[0], a[1] - b[1]), abs(0.5 * wrap(2 * (a[2] - b[2])))
+        dp, dy = self.drift(w)
         return (fuse(w), dp, dy, len(w)) if dp <= self.p.latch_pos_tol and dy <= self.p.latch_yaw_tol else None
+
+    def latch_status(self):
+        """Why the latch is not done yet, with the numbers stable() looks at."""
+        p = self.p
+        if not self.samples:
+            return 'no poses since the stop'
+        w = self.window()
+        dp, dy = self.drift(w) if len(w) > 1 else (0.0, 0.0)
+        return (f'{len(w)}/{p.latch_samples} poses, {self.samples[-1][0] - self.samples[0][0]:.1f}/{p.window_s}s since the '
+                f'first, halves differ {dp * 1000:.0f}/{p.latch_pos_tol * 1000:.0f} mm {math.degrees(dy):.1f}/'
+                f'{math.degrees(p.latch_yaw_tol):.0f} deg')
 
     # ---------------- geometry ----------------
 
-    def geometry(self, est, r):
-        """Table estimate (odom) and pelvis pose r -> (goal x, goal y in the pelvis frame, heading error to face
-        the table, pelvis -> table near face distance)."""
-        c, h = np.array(est[:2]), self.p.table_depth / 2
-        n = np.array([-math.sin(est[2]), math.cos(est[2])])        # table normal
+    @property
+    def aim(self):
+        """(stand, ahead) for geometry(): the meet point first, then the end point with a pure-pursuit lookahead."""
+        p = self.p
+        return (p.place_standoff, p.lookahead) if self.merged else (p.meet_dist, 0.0)
+
+    def geometry(self, est, r, stand, ahead=0.0):
+        """Table estimate (odom), pelvis pose r and where to stand (`stand` m from the near face along the bisector,
+        the line through the table centre normal to the long side; with `ahead` > 0 the aim point is that far up the
+        line from the robot, but never closer to the table than `stand`) -> NS(
+          tx, ty  the aim point in the pelvis frame,   eyaw  heading error to face the table,
+          rng     distance from the pelvis to the near FACE (not to its plane: a tilted estimate moves the plane
+                  next to a table that is metres away),   off  how far the robot stands to the left of the bisector).
+        The table side is the robot's; within 0.5 m of the table's long-axis plane it keeps the side chosen before."""
+        p, c, h = self.p, np.array(est[:2]), self.p.table_depth / 2
+        u = np.array([math.cos(est[2]), math.sin(est[2])])           # long axis
+        n = np.array([-u[1], u[0]])                                  # normal
         d = np.array(r[:2]) - c
-        if n @ d < 0:
-            n = -n                                                   # the robot's side
-        goal = c + (h + self.p.place_standoff) * n + self.p.lateral_offset * np.array([n[1], -n[0]])
+        ref = self.n_ref if self.n_ref is not None and abs(n @ d) <= 0.5 else d
+        n = -n if n @ ref < 0 else n
+        self.n_ref = n
+        t = np.array([n[1], -n[0]])                                  # the robot's left when it faces the table
+        s = max(stand, float(n @ d) - h - ahead) if ahead else stand
+        goal = c + p.lateral_offset * t + (h + s) * n
         dx, dy = goal - r[:2]
         co, si = math.cos(r[2]), math.sin(r[2])
-        return co * dx + si * dy, -si * dx + co * dy, wrap(math.atan2(-n[1], -n[0]) - r[2]), float(n @ d) - h
+        return NS(tx=float(co * dx + si * dy), ty=float(-si * dx + co * dy),
+                  eyaw=wrap(math.atan2(-n[1], -n[0]) - r[2]), off=float(t @ d) - p.lateral_offset,
+                  rng=math.hypot(max(float(n @ d) - h, 0.0), max(abs(float(u @ d)) - p.table_length / 2, 0.0)))
 
     # ---------------- head ----------------
 
@@ -392,19 +443,27 @@ class H2ArrivalNavigator(Node):
             return self.latch_step(now, r)
 
         est = self.est if self.latched else self.estimate()
-        tx, ty, eyaw, rng = g = self.geometry(est, r)
+        g = self.geometry(est, r, *self.aim)
+        if not self.merged and abs(g.off) <= p.line_tol:             # (a latched robot has merged)
+            self.merged = True
+            self.get_logger().info(f'[LEG] on the bisector ({g.off:+.2f} m off, face {g.rng:.2f} m away) '
+                                   f'-> turn to the table, walk in along it')
+            g = self.geometry(est, r, *self.aim)                     # the aim point is now up the line
+        tx, ty, eyaw = g.tx, g.ty, g.eyaw
         self.publish_point(tx, ty)
         self.publish_head(freeze=self.latched)
-        if not self.latched and rng <= p.latch_far and self.phase in (Phase.ROTATE, Phase.APPROACH):
+        if not self.latched and self.merged and g.rng <= p.latch_far and self.phase in (Phase.ROTATE, Phase.APPROACH):
             self.tries += 1
             self.t_latch, self.latch_t0 = now, now + p.latch_settle_s
+            self.face_yaw = r[2] + eyaw          # the heading that faces the table (odom): LATCH turns to it if needed
             self.samples.clear()                 # only poses taken after the robot stands still count
-            self.get_logger().info(f'[LATCH] try {self.tries}: table face {rng:.2f} m ahead <= {p.latch_far} m '
-                                   f'-> standing still, poses count from +{p.latch_settle_s}s')
+            self.get_logger().info(f'[LATCH] try {self.tries}: table face {g.rng:.2f} m away <= {p.latch_far} m, {g.off:+.2f} m off '
+                                   f'the bisector -> standing still, poses count from +{p.latch_settle_s}s')
             self.set_phase(Phase.LATCH)
             return self.publish_cmd(0.0, 0.0, 0.0, 'latch: stop')
 
-        dist, bearing = math.hypot(tx, ty), math.atan2(ty, tx)
+        dist = math.hypot(tx, ty)
+        bearing = math.atan2(ty, tx) * (1.0 if dist >= p.aim_blend else dist / p.aim_blend)   # fades out close to the aim point
         vx = vy = wz = 0.0
         why = self.phase.value
         if self.phase is Phase.ROTATE:
@@ -426,11 +485,15 @@ class H2ArrivalNavigator(Node):
             else:
                 vx = shape(tx, p.kp_lin, p.v_min, p.v_max, p.pos_tol)
                 vy = self.gate_sidestep(shape(ty, p.kp_lin, p.v_min, p.v_max, p.pos_tol * 2), now)
-                w_raw = p.kp_ang * bearing + p.kp_perp * eyaw        # aim at the goal and square to the table
-                if abs(bearing) >= p.yaw_tol * 2 or abs(eyaw) >= p.yaw_tol:
-                    wz = math.copysign(min(max(abs(w_raw), p.w_min), p.w_max), w_raw)
+                sq = eyaw if self.merged else 0.0                    # square to the table only on the bisector, not on the way to it
+                w_raw = p.kp_ang * bearing + p.kp_perp * sq          # aim at the goal
+                if (abs(bearing) >= p.yaw_tol * 2 or abs(sq) >= p.yaw_tol) and abs(w_raw) >= p.w_min / 2:
+                    wz = math.copysign(min(max(abs(w_raw), p.w_min), p.w_max), w_raw)   # (the two terms cancel: no +-w_min kicks)
                 why = f'approach: dist {dist:.3f} m bearing={math.degrees(bearing):+.1f} dyaw={math.degrees(eyaw):+.1f}'
         else:                                                        # FINAL: yaw first, then position
+            if not self.latched:
+                return self.fail(f'at the end point without a latched table pose: never on the bisector within {p.latch_far} m '
+                                 f'of the face ({self.n_acc} poses accepted)')
             hyst = p.settle_hyst if self.settle > 0 else 1.0
             ok = (abs(tx) < p.pos_tol * hyst, abs(ty) < p.pos_tol * hyst, abs(eyaw) < p.yaw_tol * hyst)
             if all(ok):
@@ -468,38 +531,47 @@ class H2ArrivalNavigator(Node):
         self.heartbeat(r, None)
 
     def latch_step(self, now, r):
-        self.publish_cmd(0.0, 0.0, 0.0, 'latch: standing still')
+        p = self.p
         self.publish_head()
-        s = self.stable()
+        turn, s = wrap(self.face_yaw - r[2]), None
+        if abs(turn) > 2 * p.yaw_tol:            # stopped on the bisector but not facing the table: turn on the spot first
+            self.latch_t0 = now + p.latch_settle_s    # the poses count from when it stands still and faces the table
+            self.samples.clear()
+            self.publish_cmd(0.0, 0.0, shape(turn, p.kp_ang, p.w_min, p.w_max, p.yaw_tol), f'latch: turn to the table {math.degrees(turn):+.1f} deg')
+            status = f'turning to the table, {math.degrees(turn):+.0f} deg to go'
+        else:
+            self.publish_cmd(0.0, 0.0, 0.0, 'latch: standing still')
+            s, status = self.stable(), self.latch_status()
         if s is None:
-            if now - self.t_latch > self.p.latch_timeout_s:
-                self.fail(f'no stable table pose within {self.p.latch_timeout_s}s of standing still '
-                          f'({len(self.samples)} poses since the stop)')
-            return self.heartbeat(r, None)
+            if now - self.t_latch > p.latch_timeout_s:
+                self.fail(f'no stable table pose within {p.latch_timeout_s}s of standing still ({status})')
+            live = self.estimate() if self.samples else None
+            return self.heartbeat(r, live and self.geometry(live, r, *self.aim), 'latch: ' + status)
         est, dp, dy, n = s
-        rng, p = self.geometry(est, r)[3], self.p
-        if rng > p.latch_far + p.latch_tol and self.tries < p.latch_max_tries:
-            self.get_logger().info(f'[LATCH] standing still the table face is {rng:.2f} m ahead (> {p.latch_far + p.latch_tol:.2f}): '
+        g = self.geometry(est, r, *self.aim)
+        if g.rng > p.latch_far + p.latch_tol and self.tries < p.latch_max_tries:
+            self.get_logger().info(f'[LATCH] standing still the table face is {g.rng:.2f} m away (> {p.latch_far + p.latch_tol:.2f}): '
                                    f'the live estimate stopped us early -> walking on')
             return self.set_phase(Phase.ROTATE)
-        if not p.latch_near - p.latch_tol <= rng <= p.latch_far + p.latch_tol:
-            self.get_logger().warn(f'[LATCH] range {rng:.2f} m is outside {p.latch_near}..{p.latch_far} m: latching anyway '
-                                   f'(a close table may be partly out of view)')
+        if not (p.latch_near - p.latch_tol <= g.rng <= p.latch_far + p.latch_tol and abs(g.off) <= p.line_tol):
+            self.get_logger().warn(f'[LATCH] face {g.rng:.2f} m away and {g.off:+.2f} m off the bisector is outside {p.latch_near}..'
+                                   f'{p.latch_far} m and +-{p.line_tol} m: latching anyway (a close table may be partly out of view)')
         self.est, self.latched = est, True
-        self.latch_info = dict(latched_range_m=round(rng, 3), latch_tries=self.tries, latch_samples=n,
-                               latch_drift_mm=round(dp * 1000, 1), latch_drift_deg=round(math.degrees(dy), 2))
+        self.latch_info = dict(latched_range_m=round(g.rng, 3), latched_off_m=round(g.off, 3), latch_tries=self.tries,
+                               latch_samples=n, latch_drift_mm=round(dp * 1000, 1), latch_drift_deg=round(math.degrees(dy), 2))
         self.publish_table(est)
-        self.get_logger().info(f'[LATCH] table at odom ({est[0]:.3f},{est[1]:.3f}) axis {math.degrees(est[2]):+.1f} deg, face {rng:.2f} m '
-                               f'ahead, {n} poses, halves agree within {dp * 1000:.0f} mm / {math.degrees(dy):.1f} deg -> vision ignored, walking on odometry')
+        self.get_logger().info(f'[LATCH] table at odom ({est[0]:.3f},{est[1]:.3f}) axis {math.degrees(est[2]):+.1f} deg, face {g.rng:.2f} m '
+                               f'away, {g.off:+.2f} m off the bisector, {n} poses, halves agree within {dp * 1000:.0f} mm / '
+                               f'{math.degrees(dy):.1f} deg -> vision ignored, walking on odometry')
         self.set_phase(Phase.ROTATE)
 
     def succeed(self, r, g):
         self.publish_cmd(0.0, 0.0, 0.0, 'succeeded')
         c = np.array(self.est[:2]) - r[:2]
         co, si = math.cos(r[2]), math.sin(r[2])
-        result = dict(outcome='succeeded', face_dist_m=round(g[3], 4), dyaw_deg=round(math.degrees(g[2]), 2),
-                      table_in_pelvis_m=[round(co * c[0] + si * c[1], 4), round(-si * c[0] + co * c[1], 4)],
-                      goal_error_m=[round(g[0], 4), round(g[1], 4)], **self.latch_info,
+        result = dict(outcome='succeeded', face_dist_m=round(g.rng, 4), dyaw_deg=round(math.degrees(g.eyaw), 2),
+                      table_in_pelvis_m=[round(float(co * c[0] + si * c[1]), 4), round(float(-si * c[0] + co * c[1]), 4)],
+                      goal_error_m=[round(g.tx, 4), round(g.ty, 4)], **self.latch_info,
                       head_pitch_deg=None if self.head_cmd is None else round(math.degrees(self.head_cmd), 2))
         self.set_phase(Phase.DONE)
         self.publish_result(result)
@@ -532,22 +604,28 @@ class H2ArrivalNavigator(Node):
         msg.linear.x, msg.linear.y, msg.angular.z = float(vx), float(vy), float(wz)
         self.pub_cmd.publish(msg)
 
-    def heartbeat(self, r, g):
+    def heartbeat(self, r, g, extra=''):
+        """One status line per log_period_s. g: geometry() of the table estimate (None: no estimate yet)."""
         now = self.now()
         if self.last_hb is not None and now - self.last_hb < self.p.log_period_s:
             return
         self.last_hb = now
         est = self.est if self.latched else (self.estimate() if self.samples else None)
         tab = 'table=none' if est is None else f'table@odom=({est[0]:+.2f},{est[1]:+.2f}) axis={math.degrees(est[2]):+.0f}'
-        geo = 'goal=n/a' if g is None else (f'face={g[3]:.2f} goal=({g[0]:+.2f},{g[1]:+.2f}) '
-                                            f'bearing={math.degrees(math.atan2(g[1], g[0])):+.1f} dyaw={math.degrees(g[2]):+.1f}')
+        geo = 'goal=n/a' if g is None else (f'face={g.rng:.2f} off={g.off:+.2f} goal=({g.tx:+.2f},{g.ty:+.2f}) '
+                                            f'bearing={math.degrees(math.atan2(g.ty, g.tx)):+.1f} dyaw={math.degrees(g.eyaw):+.1f}')
+        if self.latched and self.live:                                # the camera's opinion of the frozen table
+            dp = math.hypot(self.live[1] - est[0], self.live[2] - est[1])
+            extra = (f'live-latched {dp:.2f} m {math.degrees(abs(0.5 * wrap(2 * (self.live[3] - est[2])))):.1f} deg '
+                     f'(pose age {now - self.live[0]:.1f}s)')
+        leg = ' LATCHED' if self.latched else ('' if self.phase is Phase.SCAN else f' leg={"line" if self.merged else "meet"}')
         head = 'head=policy' if self.head_cmd is None else f'head={math.degrees(self.head_cmd):+.1f}'
         age = f'{now - self.samples[-1][0]:.1f}s' if self.samples else 'n/a'
         c = self.last_cmd
         self.get_logger().info(
-            f'[HB] {self.phase.value}{" LATCHED" if self.latched else ""} | {tab} | pelvis@odom=({r[0]:+.2f},{r[1]:+.2f},{math.degrees(r[2]):+.0f}) | '
+            f'[HB] {self.phase.value}{leg} | {tab} | pelvis@odom=({r[0]:+.2f},{r[1]:+.2f},{math.degrees(r[2]):+.0f}) | '
             f'{geo} | {head} | pose age={age} n={len(self.samples)} | cmd=({c[0]:+.2f},{c[1]:+.2f},{c[2]:+.2f}) | '
-            f'rx={self.n_rx} acc={self.n_acc} rej={self.n_rej} tf_fail={self.n_tf_fail}')
+            f'rx={self.n_rx} acc={self.n_acc} rej={self.n_rej} tf_fail={self.n_tf_fail}' + (f' | {extra}' if extra else ''))
 
     def log_counters(self):
         self.get_logger().info(f'[STATS] poses rx={self.n_rx} accepted={self.n_acc} rejected={self.n_rej} tf_failed={self.n_tf_fail} '
