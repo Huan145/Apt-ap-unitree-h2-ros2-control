@@ -589,3 +589,12 @@ def test_every_phase_change_is_followed_by_a_pause_with_zero_velocity():
         window = [r for r in rec if t0 + 1.0 <= r[0] <= t0 + 1.9]                      # the speed lags the command (tau 0.25 s)
         assert window and max(r[4] for r in window) < 0.03, (rec[i][5], t0)
     assert max(r[4] for r in rec) <= 0.40 + 0.03
+
+
+def test_no_turn_command_is_below_what_the_policy_responds_to():
+    """The free-box policy does not turn for |wz| below ~0.6 rad/s (seen in the sim: 0.29 did nothing)."""
+    for kw in ({}, {'robot': (2.5, 3.5, math.radians(-60)), 'table': (4.5, 0.0, math.pi / 2)}):
+        n, sim, _, phase = run_nominal(**kw)
+        assert phase == 'succeeded'
+        w = [abs(c.angular.z) for c in n.pubs['cmd_vel'].msgs if c.angular.z != 0.0]
+        assert w and min(w) >= 0.6 and max(w) <= n.p.w_max + 1e-9, (min(w), max(w))

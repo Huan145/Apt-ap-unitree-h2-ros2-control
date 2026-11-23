@@ -134,7 +134,8 @@ ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{}"
 | `scan_wait_s`, `scan_w`, `scan_dir` | 3.0, 0.70, +1 | stand still, then turn left at 0.7 rad/s; fails after `scan_max_deg` 400 |
 | `phase_pause_s` | 2.0 | s, the robot stands still (zero `cmd_vel`) after every phase change (SCAN → ROTATE → APPROACH → LATCH → ROTATE → APPROACH → FINAL, and each ROTATE ↔ APPROACH switch) so it settles. 0 turns it off |
 | `v_max` | 0.40 | m/s walking speed limit (`h2_local_navigator` uses 0.50). `v_min` 0.17 |
-| `w_min w_max kp_* *_tol` | as `h2_local_navigator` | tuned there for the **no-box** policy; check them with the box |
+| `w_min`, `w_max` | 0.65, 0.90 | rad/s turn rate limits. The policy does not turn below ~0.6 rad/s (a 0.29 command did nothing in the sim), so every turn command is at least 0.65. `scan_w` 0.7 |
+| `kp_* *_tol` | as `h2_local_navigator` | tuned there for the **no-box** policy; check them with the box |
 | `head_*` | as `h2_local_navigator` | aims at the table centre's **elevation** (independent of where the robot faces), held after the latch. The free-box policy was trained with head pitch 0: if it walks badly with the head down, cap it with `-p head_pitch_max:=0.3` |
 
 ## Reading the `[HB]` line
@@ -157,7 +158,7 @@ success carries `face_dist_m` (pelvis → table face, what the place step needs)
 
 ## Tests
 
-`pytest tests` (98 in all; 52 in `tests/navigation`, no ROS needed). They drive the node in a small kinematic world
+`pytest tests` (99 in all; 53 in `tests/navigation`, no ROS needed). They drive the node in a small kinematic world
 (`navsim.py`): velocity lag 0.25 s, vision 0.3 s late and noisy, camera blind below 1.2 m, tracker gaps, 180° flips,
 a re-estimation jump inside the latch window, odometry loss. They check arrival within 8 cm / 6° of the goal (10 cm / 7°
 for the noisy and sideways cases), and the new approach: from beside the table's end the robot meets the bisector more

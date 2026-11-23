@@ -85,7 +85,7 @@ PARAMS = dict(
     # pose sanity
     max_range=9.0, min_horizontal_y=0.20,
     # motion: same names and defaults as h2_local_navigator (tuned there for the no-box policy)
-    v_min=0.17, v_max=0.40, w_min=0.25, w_max=0.50, kp_lin=1.0, kp_ang=1.5, kp_perp=0.6,
+    v_min=0.17, v_max=0.40, w_min=0.65, w_max=0.90, kp_lin=1.0, kp_ang=1.5, kp_perp=0.6,
     sidestep_max_s=2.0, sidestep_pause_s=2.0,
     pos_tol=0.05, yaw_tol=math.radians(4), capture_radius=0.15, bearing_gate=math.radians(30),
     settle_cycles=20, settle_hyst=1.4, nav_timeout_s=180.0, phase_pause_s=2.0, lost_grace_s=5.0,
