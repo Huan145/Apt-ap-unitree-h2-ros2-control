@@ -36,10 +36,13 @@ be back in control first: /controller_select "balance"):
   8 unload    arms still; box-weight compensation fades out over LOAD_RAMP_S
   9 release   hands straight out by GRASP_REACH_M + --squeeze (the pinch, reversed)
  10 retract   to the wide pose (as phase 1, position only)
- 11 home      joint space to HOME_POSE = arm defaults of UNITREE_H2_CFG (walking + balance policies)
- 12 done      hold HOME_POSE -> hand over to the no-box walking controller
+ 11 clear     hands back toward the body at --clear X Y Z (pelvis frame, right = -Y), position only,
+              so the arms swing down beside the body, behind the table edge, not through the table
+ 12 home      joint space to HOME_POSE = arm defaults of UNITREE_H2_CFG (walking + balance policies)
+ 13 done      hold HOME_POSE -> hand over to the no-box walking controller
 --place-only: start HERE with the robot already holding the box (no pickup, no FoundationPose targets):
-  grip      hands in by --squeeze from the MEASURED pose (a fresh process has no squeezed command),
+  grip      hands in by --grip-squeeze (5 cm) from the MEASURED pose (a fresh process has no squeezed command;
+            the measured hold pose already sags, so it needs more than the pickup's --squeeze),
             box-weight compensation on from the start; then lower ... done as above
 load_expected stays True from carry to the end ("flag 1, no load" is in the training distribution;
 1 -> 0 never happens in training).
@@ -151,7 +154,7 @@ HOME_POSE_DICT.update({"left_shoulder_pitch_joint": 0.28, "right_shoulder_pitch_
                        "left_elbow_joint": 0.52, "right_elbow_joint": 0.52})
 # Phase machine
 PHASES = ["wide", "standoff", "pinch", "tilt", "carry", "hold",
-          "grip", "lower", "unload", "release", "retract", "home", "done"]   # grip: --place-only
+          "grip", "lower", "unload", "release", "retract", "clear", "home", "done"]   # grip: --place-only
 PATHS = {"carry", "grip", "lower", "release"}     # straight Cartesian paths through CARRY_STEPS IK knots
 WAIT = {"hold", "done"}                   # no move; hold waits for /sequencer_cmd "place"
 LIVE = {"standoff"}                       # replanned (after the current move) when the target moved
@@ -162,7 +165,7 @@ WARN_EVERY_S = 2.0
 WAIT_TIMEOUT_S = 10.0
 LEVEL_WARN_M = 0.03       # warn when the two targets differ in height by more than this
 SETTLE_S, SETTLE_MOVE_MM = 1.0, 2.0      # hands moved < 2 mm in 1 s = settled
-SETTLED_MAX_MM = {"wide": np.inf, "standoff": 30.0, "retract": np.inf, "home": np.inf}   # settled -> ends anyway;
+SETTLED_MAX_MM = {"wide": np.inf, "standoff": 30.0, "retract": np.inf, "clear": np.inf, "home": np.inf}   # settled -> ends anyway;
                                                       # wide is only a clearance via point; standoff next to the box
                                                       # far off = blocked -> keep waiting
 GRAV_MAX_RAD = 0.3        # cap on the gravity-compensation offset per joint
@@ -457,11 +460,13 @@ class PickupSequencer(Node):
             return p + [self.a.place_dx, 0.0, dz], R
         u = (pl - pr) * [1, 1, 0]
         u /= np.linalg.norm(u)
-        if self.name == "grip":      # squeeze: hands in by --squeeze (they rest on the box sides now)
-            return p - arm.sign * self.a.squeeze * u, R
+        squeeze = self.a.grip_squeeze if self.a.place_only else self.a.squeeze   # the squeeze actually applied
+        if self.name == "grip":      # squeeze: hands in from where they rest on the box sides
+            return p - arm.sign * squeeze * u, R
         if self.name == "release":   # straight out along the grip axis, the pinch reversed
-            return p + arm.sign * (GRASP_REACH_M + self.a.squeeze) * u, R
-        return np.array(self.a.wide) * [1.0, arm.sign, 1.0], None   # retract: wide pose, orientation free
+            return p + arm.sign * (GRASP_REACH_M + squeeze) * u, R
+        xyz = self.a.clear if self.name == "clear" else self.a.wide     # retract: wide pose / clear
+        return np.array(xyz) * [1.0, arm.sign, 1.0], None               # position only, orientation free
 
     def start_plan(self, arm):
         arm.cancel.set()
@@ -733,6 +738,10 @@ def main():
     p.add_argument("--place-only", action="store_true",
                    help="start at the place with the robot already holding the box (grip, lower, ... home); "
                         "start it BEFORE Play, with the balance controller, so the arms never get the policy's default")
+    p.add_argument("--grip-squeeze", type=float, default=0.05,
+                   help="--place-only grip: press this far into the box from the measured hold pose (m)")
+    p.add_argument("--clear", type=float, nargs=3, default=[0.0, 0.40, 0.25], metavar=("X", "Y", "Z"),
+                   help="clear: LEFT hand pose before home, pelvis frame (m); right = (X, -Y, Z)")
     p.add_argument("--place-z", type=float, default=0.10,
                    help="lower: hand midpoint height above the pelvis to put the box down at (m)")
     p.add_argument("--place-dx", type=float, default=0.0, help="lower: also move the box this far forward (m)")
