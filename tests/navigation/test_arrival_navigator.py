@@ -331,7 +331,7 @@ def test_walks_in_latches_in_the_window_and_arrives_on_odometry_with_the_camera_
     n, sim, marks, phase = run_nominal()
     assert phase == 'succeeded'
     dx, dy, dyaw, face = sim.true_errors()
-    assert STANDOFF == 0.0                                                                   # the end: pelvis on the table's face line
+    assert STANDOFF == 0.07                                                                  # the end: 7 cm pelvis -> table face
     assert math.hypot(dx, dy) < 0.08 and abs(dyaw) < math.radians(6) and face == pytest.approx(STANDOFF, abs=0.08)
     info = result(n)
     assert 1.7 - 0.15 <= info['latched_range_m'] <= 2.0 + 0.15 and info['latch_tries'] == 1
@@ -473,6 +473,7 @@ def test_closer_than_the_window_on_the_bisector_it_latches_where_it_stands_and_n
 def test_stopped_in_the_window_but_turned_away_it_turns_on_the_spot_to_face_the_table_before_it_latches():
     m = {}
     n, sim, _, phase = run_nominal(robot=(1.5, 0.0, math.radians(35)),                      # inside the window, turned 35 deg away
+                                   params={'view_min_deg': 60.0, 'scan_center_deg': 90.0},  # (the scan would turn it first)
                                    hooks=[record(m, 'stop', lambda n: n.phase is nav.Phase.LATCH),
                                           record(m, 'latched', lambda n: n.latched)])
     assert phase == 'succeeded'
@@ -512,7 +513,7 @@ def test_a_sideways_slip_next_to_the_table_does_not_swing_the_heading():
 
 
 def test_a_robot_that_cannot_turn_fails_the_latch_instead_of_waiting_for_ever():
-    n = make(latch_timeout_s=6.0)
+    n = make(latch_timeout_s=6.0, view_min_deg=60.0, scan_center_deg=90.0)
     sim = Sim(n, robot=(1.5, 0.0, math.radians(35)), table=(3.8, 0.0, math.pi / 2), tau=1e9)    # velocity never follows the command
     start(n)
     assert sim.run() == 'failed'
@@ -524,7 +525,7 @@ def test_the_latch_looks_at_the_distance_to_the_face_not_to_its_plane():
     """The Nov 22 run latched 5 m from the table because the (infinite) plane of the near face passed 1.6 m from the
     robot. Here the other two conditions (on the bisector, aimed at the table) hold, so only the range can refuse."""
     phi = math.radians(24)                                           # table 4.9 m away, long axis 24 deg off the line of sight
-    n = make()
+    n = make(view_min_deg=179.0)                                     # (the pose is 66 deg off the axis: the view gate is not under test)
     sim = Sim(n, robot=(0.0, 0.0, math.atan2(-math.cos(phi), math.sin(phi))), table=(4.9, 0.0, phi), sigma=(0.0, 0.0),
               fov=math.radians(179), blocked_below=-9.0)
     n.phase, n.t_start, n.merged = nav.Phase.SCAN, 0.0, True
@@ -581,12 +582,12 @@ def test_no_back_and_forth_turning_kicks_while_walking_in():
 
 def test_every_phase_change_is_followed_by_a_pause_with_zero_velocity():
     n, sim, _, phase = run_nominal()
-    assert phase == 'succeeded' and n.p.phase_pause_s == 2.0 and n.p.v_max == 0.40
+    assert phase == 'succeeded' and n.p.phase_pause_s == 1.0 and n.p.v_max == 0.40
     rec, changes = sim.rec, [i for i in range(1, len(sim.rec)) if sim.rec[i][5] != sim.rec[i - 1][5] and sim.rec[i][5] not in ('succeeded', 'failed')]
     assert len(changes) >= 3
     for i in changes:
         t0 = rec[i][0]
-        window = [r for r in rec if t0 + 1.0 <= r[0] <= t0 + 1.9]                      # the speed lags the command (tau 0.25 s)
+        window = [r for r in rec if t0 + 0.8 <= r[0] <= t0 + 0.9]                      # the speed lags the command (tau 0.25 s)
         assert window and max(r[4] for r in window) < 0.03, (rec[i][5], t0)
     assert max(r[4] for r in rec) <= 0.40 + 0.03
 
@@ -598,3 +599,90 @@ def test_no_turn_command_is_below_what_the_policy_responds_to():
         assert phase == 'succeeded'
         w = [abs(c.angular.z) for c in n.pubs['cmd_vel'].msgs if c.angular.z != 0.0]
         assert w and min(w) >= 0.6 and max(w) <= n.p.w_max + 1e-9, (min(w), max(w))
+
+
+# ---------------- good view only, lost table, wrong estimate (Nov 23 run) ----------------
+
+EDGE = (33, 0.6, math.radians(76))          # a table centre more than 33 deg off the axis is partly in the image: pose shifted, axis +76 deg
+
+
+def test_scan_does_not_stop_at_the_first_poses_but_waits_for_a_view_with_the_table_well_in_the_image():
+    """Nov 23: the scan stopped after 54 deg, when the table's near end touched the left edge of the image, and the pose
+    of that sliver (axis +76 deg instead of 0, centre 0.8 m off) sent the robot walking the wrong way."""
+    m = {}
+    at_rotate = lambda s: m.setdefault('rot', (s.node.estimate(), s.x, s.y, s.yaw)) if s.node.phase is nav.Phase.ROTATE else None
+    n, sim, _, phase = run_nominal(robot=(2.3, 0.05, 0.0), table=(0.8, 5.4, 0.0), vision_range=7.0, edge=EDGE, hooks=[at_rotate])
+    est, x, y, yaw = m['rot']
+    assert math.hypot(est[0] - 0.8, est[1] - 5.4) < 0.1 and abs(0.5 * nav.wrap(2 * est[2])) < math.radians(3)
+    assert abs(nav.wrap(math.atan2(5.4 - y, 0.8 - x) - yaw)) < math.radians(12)           # the table centre is near the camera axis
+    assert phase == 'succeeded' and n.n_edge > 0 and n.log.has('info', '[SCAN] table found')
+    dx, dy, dyaw, face = sim.true_errors()
+    assert math.hypot(dx, dy) < 0.10 and abs(dyaw) < math.radians(7)
+
+
+def test_poses_with_the_table_at_the_image_edge_are_ignored_while_the_robot_walks_with_the_table_off_to_the_side():
+    """The meet leg walks with the table 50 deg off the axis on purpose. Its partial-view poses must not move the estimate."""
+    n, sim, _, phase = run_nominal(robot=(2.5, 3.5, math.radians(-60)), table=(4.5, 0.0, math.pi / 2), edge=EDGE)
+    assert phase == 'succeeded', result(n)
+    assert n.n_edge > 5 and abs(result(n)['latched_off_m']) < 0.3 and not n.log.has('warn', '[LOST]')
+    dx, dy, dyaw, face = sim.true_errors()
+    assert math.hypot(dx, dy) < 0.10 and abs(dyaw) < math.radians(7)
+
+
+def gap_hook(m, after, length):
+    """Sim hook: no vision for `length` s, starting `after` s into the approach phase."""
+    def h(s):
+        if s.node.phase is nav.Phase.APPROACH:
+            t0 = m.setdefault('t0', s.t + after)
+            s.vision_on = not (t0 <= s.t < t0 + length)
+    return h
+
+
+def test_it_stands_still_when_the_table_should_be_in_view_but_no_pose_comes_and_walks_on_when_poses_return():
+    m = {}
+    n, sim, _, phase = run_nominal(hooks=[gap_hook(m, 1.0, 9.0)])
+    assert phase == 'succeeded', result(n)
+    still = [r for r in sim.rec if m['t0'] + 4.5 <= r[0] <= m['t0'] + 8.5]                  # 1.5 s stale + 0.3 s latency + the stop
+    assert still and max(r[4] for r in still) < 0.03
+    assert n.log.has('warn', '[LOST]') and n.log.has('info', 'table seen again')
+    dx, dy, dyaw, face = sim.true_errors()
+    assert math.hypot(dx, dy) < 0.10 and abs(dyaw) < math.radians(7)
+
+
+def test_a_table_that_does_not_come_back_fails_with_the_reason_instead_of_walking_on():
+    n, sim, _, phase = run_nominal(params={'lost_timeout_s': 4.0}, hooks=[gap_hook({}, 1.0, 1e9)])
+    assert phase == 'failed' and 'table lost' in result(n)['reason'] and cmd(n) == (0.0, 0.0, 0.0)
+    assert sim.speed_during('failed') < 0.03 and sim.t < 40.0
+
+
+def displaced(until, by=1.5):
+    """Sim hook: the table looks displaced `by` m along its long axis until `until` s (a wrong estimate that is corrected)."""
+    return lambda s: s.bias_windows.append((0.0, until, (0.0, by))) if not s.bias_windows else None
+
+
+def test_a_corrected_estimate_after_merging_sends_it_back_to_the_meet_leg_and_the_latch_is_on_the_true_line():
+    n, sim, _, phase = run_nominal(hooks=[displaced(12.0)])
+    assert phase == 'succeeded', result(n)
+    assert n.log.has('info', 'meet leg again') and abs(result(n)['latched_off_m']) < 0.4
+    dx, dy, dyaw, face = sim.true_errors()
+    assert math.hypot(dx, dy) < 0.10 and abs(dyaw) < math.radians(7)
+
+
+def test_a_wrong_estimate_with_the_real_table_visible_off_the_axis_is_corrected_instead_of_deadlocking():
+    """The poses of the real table are 'off the axis' for the estimate's idea of where it is: the robot has to turn to
+    them (lost guard) or, when already latching, turn to what the camera sees."""
+    for until in (9.0, 15.0):
+        n, sim, _, phase = run_nominal(hooks=[displaced(until)])
+        assert phase == 'succeeded', (until, result(n))
+        dx, dy, dyaw, face = sim.true_errors()
+        assert math.hypot(dx, dy) < 0.10 and abs(dyaw) < math.radians(7), until
+
+
+def test_scan_stands_still_until_the_poses_are_settled_not_after_the_first_three():
+    n = make()
+    sim = Sim(n, robot=(0.0, 0.0, 0.0), table=(5.0, 0.0, math.pi / 2), vision_range=9.0)
+    start(n)
+    sim.run(until=lambda s: len(n.samples) >= 3)
+    assert n.phase is nav.Phase.SCAN and cmd(n)[2] == 0.0              # the table is in view: stand still and wait
+    sim.run(until=lambda s: n.phase is not nav.Phase.SCAN)
+    assert n.phase is nav.Phase.ROTATE and len(n.samples) >= n.p.latch_samples

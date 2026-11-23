@@ -7,7 +7,9 @@ Same interface as h2_local_navigator.py (Trigger services ~/start and ~/cancel, 
 camera loses near the end of the walk (box in the hands, table filling the view). The robot comes in along the
 table's BISECTOR, the line through the table centre normal to its long side:
 
-  SCAN             no table yet: stand still scan_wait_s, then turn slowly until poses arrive
+  SCAN             no table yet: stand still scan_wait_s, then turn until the table is WELL IN VIEW (poses whose table
+                   centre is too far off the camera axis are ignored: the table is only partly in the image and its pose
+                   is wrong), then stand still until those poses agree
   ROTATE, APPROACH leg "meet": walk to the meet point on the bisector, meet_dist (3.0 m) from the table face,
                    steering by bearing only. Within line_tol (0.4 m) of the bisector: leg "line": turn to the table
                    and walk in along the bisector (the aim point is the end point)
@@ -19,6 +21,10 @@ table's BISECTOR, the line through the table centre normal to its long side:
                    on the frozen table and the pelvis pose from TF (odometry): straight in along the bisector to
                    place_standoff from the table face, square to it. Vision is ignored from the latch on (the live
                    pose is only logged, next to the latched one)
+
+Only poses with the table centre close enough to the camera axis that the whole table fits the image count
+(view_limit); while it is further off the estimate stays frozen and the robot walks on odometry. If the table
+should be in view but no pose arrived for stale_pose_s, the robot stands still (and turns to it) until poses return.
 
 The table is kept in a FIXED frame (odom_frame): every /workstation_pose is mapped with the pelvis pose at
 its image time, so a late or missing detection cannot bend the walk (the table does not move), and walking
@@ -63,8 +69,8 @@ PARAMS = dict(
     # table (size from targets.yaml) and where to stand
     table_depth=0.762,          # m, short side (mesh X)
     table_length=2.474,         # m, long side (mesh Y)
-    place_standoff=0.00,        # m, pelvis -> table near face at the end. The carry pose of H2_pickup_sequencer holds the box
-                                #    front 0.35 m ahead of the pelvis (grip x 0.20 + half the 0.30 m box): 0.35 m over the table at 0.0
+    place_standoff=0.07,        # m, pelvis -> table near face at the end. The carry pose of H2_pickup_sequencer holds the box
+                                #    front 0.35 m ahead of the pelvis (grip x 0.20 + half the 0.30 m box): 0.28 m over the table at 0.07
     lateral_offset=0.0,         # m, stand this far to the robot's LEFT of the table centre (the bisector moves with it)
     # approach: meet the bisector, then walk in along it
     meet_dist=3.0,              # m, meet point on the bisector, from the near face (keep it above latch_far)
@@ -82,13 +88,21 @@ PARAMS = dict(
     latch_timeout_s=20.0,       # s (tracker gaps of 2-9 s were seen)
     # scan
     scan_wait_s=3.0, scan_w=0.70, scan_dir=1.0, scan_max_deg=400.0, min_samples=3,
+    scan_center_deg=8.0,        # the scan turns until the table centre is this close to the camera axis, then stands still
+    scan_settle_s=8.0,          # s standing still with the table in view; after that go on with what there is
+    # which poses count: the table centre must be within view_limit() of the camera axis (a table at the image edge is
+    # only partly visible and its pose comes out wrong: axis +76 deg instead of 0, centre 0.8 m off, Nov 23)
+    fov_half_deg=41.0, view_margin_deg=4.0, view_min_deg=10.0,
+    stale_pose_s=1.5,           # s without a pose although the table should be in view: stand still ...
+    lost_timeout_s=12.0,        # s ... and fail after this long
+    unmerge_tol=0.8,            # m, off the bisector by more than this (a corrected estimate): meet leg again
     # pose sanity
     max_range=9.0, min_horizontal_y=0.20,
     # motion: same names and defaults as h2_local_navigator (tuned there for the no-box policy)
     v_min=0.17, v_max=0.40, w_min=0.65, w_max=0.90, kp_lin=1.0, kp_ang=1.5, kp_perp=0.6,
     sidestep_max_s=2.0, sidestep_pause_s=2.0,
     pos_tol=0.05, yaw_tol=math.radians(4), capture_radius=0.15, bearing_gate=math.radians(30),
-    settle_cycles=20, settle_hyst=1.4, nav_timeout_s=180.0, phase_pause_s=2.0, lost_grace_s=5.0,
+    settle_cycles=20, settle_hyst=1.4, nav_timeout_s=180.0, phase_pause_s=1.0, lost_grace_s=5.0,
     # head (center mode of h2_local_navigator: keep the table centre in the vertical middle of the image)
     head_enable=True, head_joint='head_pitch_joint', head_pitch_sign=1.0, head_pitch_min=-0.5,
     head_pitch_max=0.5, head_gain=0.7, head_deadband=math.radians(1.0), head_hold_after_done=True,
@@ -185,7 +199,9 @@ class H2ArrivalNavigator(Node):
         self.side_pause_until, self.settle, self.scanned = 0.0, 0, 0.0
         self.head_target = self.head_cmd = self.head_err = None
         self.last_cmd, self.last_hb = (0.0, 0.0, 0.0), None
-        self.n_rx = self.n_acc = self.n_rej = self.n_tf_fail = 0
+        self.n_rx = self.n_acc = self.n_rej = self.n_tf_fail = self.n_edge = 0
+        self.lost_t0 = self.lost_n0 = self.scan_t0 = None   # table lost since / poses then / table in view since (scan)
+        self.edge = None                           # (image time, x, y in odom) of the newest pose ignored for being too far off the axis
 
     # ---------------- time, TF ----------------
 
@@ -221,6 +237,17 @@ class H2ArrivalNavigator(Node):
         v = (p.x, p.y, p.z, q.x, q.y, q.z, q.w)
         if not all(map(math.isfinite, v)) or np.linalg.norm(v[:3]) > self.p.max_range:
             return None if self.latched else self.reject('pose is NaN or further than max_range')
+        if not self.latched and not self.in_view(p.x, p.y):
+            self.n_edge += 1
+            self.aim_head(msg, t)                                    # the head only needs the elevation, which survives
+            T_odom = self.tf(self.p.odom_frame, msg.header.frame_id, msg.header.stamp)
+            if T_odom is not None:                                   # where the table is seen, to turn toward it (never to steer by)
+                c = T_odom @ np.array([p.x, p.y, p.z, 1.0])
+                self.edge = (t, float(c[0]), float(c[1]))
+            self.get_logger().info(f'[VIEW] pose ignored: table centre {math.degrees(math.atan2(p.y, p.x)):+.0f} deg off the camera axis '
+                                   f'at {math.hypot(p.x, p.y):.1f} m, more than {self.view_limit(math.hypot(p.x, p.y)):.0f} deg: the '
+                                   f'table is only partly in the image', throttle_duration_sec=5.0)
+            return
         T_odom = self.tf(self.p.odom_frame, msg.header.frame_id, msg.header.stamp)
         if T_odom is None:
             self.n_tf_fail += 1
@@ -238,6 +265,27 @@ class H2ArrivalNavigator(Node):
         self.aim_head(msg, t)
         if self.p.log_poses:
             self.get_logger().info(f'[POSE] odom ({s[1]:.3f},{s[2]:.3f}) axis {math.degrees(s[3]):+.1f} deg')
+
+    def view_limit(self, dist):
+        """Largest angle (deg) between the camera axis and the table centre, `dist` m away, at which the whole table
+        (worst case: seen broadside) is still inside the image; at least view_min_deg."""
+        p = self.p
+        return max(p.fov_half_deg - p.view_margin_deg - math.degrees(math.atan2(p.table_length / 2, dist)), p.view_min_deg)
+
+    def last_seen(self, r, now):
+        """(bearing rad off the camera axis, age s) of where the table was last seen: the newest of the accepted poses and
+        the ones ignored for being too far off the axis (those are only good enough to turn toward)."""
+        t_acc = self.samples[-1][0] if self.samples else -1e9
+        t_edge = self.edge[0] if self.edge else -1e9
+        if t_edge > t_acc:
+            cx, cy = self.edge[1:]
+        else:
+            cx, cy = self.estimate()[:2]
+        return wrap(math.atan2(cy - r[1], cx - r[0]) - r[2]), now - max(t_acc, t_edge)
+
+    def in_view(self, x, y):
+        """Table centre (x forward, y left, pelvis frame) close enough to the camera axis for a good pose."""
+        return abs(math.degrees(math.atan2(y, x))) <= self.view_limit(math.hypot(x, y))
 
     def reject(self, why):
         self.n_rej += 1
@@ -446,12 +494,18 @@ class H2ArrivalNavigator(Node):
             return self.latch_step(now, r)
 
         est = self.est if self.latched else self.estimate()
+        if not self.latched and self.lost_guard(now, r, est):
+            return
         g = self.geometry(est, r, *self.aim)
         if not self.merged and abs(g.off) <= p.line_tol:             # (a latched robot has merged)
             self.merged = True
             self.get_logger().info(f'[LEG] on the bisector ({g.off:+.2f} m off, face {g.rng:.2f} m away) '
                                    f'-> turn to the table, walk in along it')
             g = self.geometry(est, r, *self.aim)                     # the aim point is now up the line
+        elif self.merged and not self.latched and abs(g.off) > p.unmerge_tol:
+            self.merged = False                                      # the estimate changed: the line is somewhere else
+            self.get_logger().info(f'[LEG] {g.off:+.2f} m off the bisector (more than {p.unmerge_tol} m): meet leg again')
+            g = self.geometry(est, r, *self.aim)
         tx, ty, eyaw = g.tx, g.ty, g.eyaw
         self.publish_point(tx, ty)
         self.publish_head(freeze=self.latched)
@@ -519,23 +573,76 @@ class H2ArrivalNavigator(Node):
         self.heartbeat(r, g)
 
     def scan_step(self, now, r):
-        if len(self.samples) >= self.p.min_samples:
-            self.get_logger().info(f'[SCAN] table found after {now - self.t_start:.1f}s, turned {math.degrees(self.scanned):.0f} deg')
-            self.set_phase(Phase.ROTATE)
-            return self.publish_cmd(0.0, 0.0, 0.0, 'table found')
+        p = self.p
         self.scanned += abs(wrap(r[2] - self.yaw_prev)) if self.yaw_prev is not None else 0.0
         self.yaw_prev = r[2]
-        if math.degrees(self.scanned) > self.p.scan_max_deg:
+        if math.degrees(self.scanned) > p.scan_max_deg:
             return self.fail(f'table not found after turning {math.degrees(self.scanned):.0f} deg ({self.n_rx} poses '
-                             f'received, {self.n_acc} accepted): is /active_target "workstation" and {self.p.pose_topic} published?')
+                             f'received, {self.n_acc} accepted, {self.n_edge} ignored as too far off the camera axis): is '
+                             f'/active_target "workstation" and {p.pose_topic} published?')
         self.publish_head()
-        wz = self.p.scan_dir * self.p.scan_w if now - self.t_start >= self.p.scan_wait_s else 0.0
-        self.publish_cmd(0.0, 0.0, wz, f'scan: {len(self.samples)}/{self.p.min_samples} poses')
-        self.heartbeat(r, None)
+        wz, status = 0.0, f'scan: {len(self.samples)} poses'
+        if self.samples and now - self.samples[-1][0] <= p.stale_pose_s + p.window_s:   # the table has been well in view
+            self.scan_t0 = now if self.scan_t0 is None else self.scan_t0
+            est = self.estimate()
+            b = wrap(math.atan2(est[1] - r[1], est[0] - r[0]) - r[2])      # where the table centre is now (odometry)
+            settled = self.stable() is not None
+            if abs(math.degrees(b)) > p.scan_center_deg:                  # the turn overshot (or the table is off to a side): centre it
+                wz, status = shape(b, p.kp_ang, p.w_min, p.w_max, math.radians(p.scan_center_deg)), f'scan: centring the table, {math.degrees(b):+.0f} deg'
+                self.scan_t0 = now
+            elif settled or (now - self.scan_t0 > p.scan_settle_s and len(self.samples) >= p.min_samples):
+                self.get_logger().info(
+                    f'[SCAN] table found after {now - self.t_start:.1f}s, turned {math.degrees(self.scanned):.0f} deg, centre '
+                    f'{math.degrees(b):+.0f} deg off the camera axis'
+                    + ('' if settled else f' (poses never settled in {p.scan_settle_s}s: {self.latch_status()})'))
+                self.set_phase(Phase.ROTATE)
+                return self.publish_cmd(0.0, 0.0, 0.0, 'table found')
+            else:
+                status = 'scan: table in view, waiting for its pose to settle: ' + self.latch_status()
+        else:
+            self.scan_t0 = None
+            if self.edge and now - self.edge[0] <= p.stale_pose_s + p.window_s:     # seen, but too far off the axis: turn to it
+                b = self.last_seen(r, now)[0]
+                wz, status = math.copysign(p.scan_w, b), f'scan: table at the image edge ({math.degrees(b):+.0f} deg), turning to it'
+            else:
+                wz = p.scan_dir * p.scan_w if now - self.t_start >= p.scan_wait_s else 0.0
+        self.publish_cmd(0.0, 0.0, wz, status)
+        self.heartbeat(r, None, status)
+
+    def lost_guard(self, now, r, est):
+        """True while standing still because the table should be in the image (by the estimate and the odometry) but no
+        pose came for stale_pose_s: the tracker lost it, or the estimate is wrong. The robot stops (it does not walk on
+        a frozen estimate) and turns to where the table should be, until poses return; fails after lost_timeout_s.
+        A table that is out of view on purpose (the meet leg walks with it off to the side) is not lost."""
+        p = self.p
+        dx, dy = est[0] - r[0], est[1] - r[1]
+        b, age = wrap(math.atan2(dy, dx) - r[2]), now - self.samples[-1][0]      # by the estimate
+        if self.lost_t0 is not None and self.n_acc - self.lost_n0 >= p.min_samples:
+            self.get_logger().info(f'[LOST] table seen again after {now - self.lost_t0:.1f}s')
+            self.lost_t0 = None
+        if self.lost_t0 is None:
+            if age <= p.stale_pose_s or abs(math.degrees(b)) > self.view_limit(math.hypot(dx, dy)):
+                return False
+            self.lost_t0, self.lost_n0 = now, self.n_acc
+            self.get_logger().warn(f'[LOST] no pose for {age:.1f}s although the table should be in view '
+                                   f'({math.degrees(b):+.0f} deg off the camera axis): standing still, turning to it')
+        if now - self.lost_t0 > p.lost_timeout_s:
+            self.fail(f'table lost: no pose for {age:.0f}s ({math.degrees(b):+.0f} deg off the camera axis by the estimate, '
+                      f'{self.n_acc} poses accepted, {self.n_edge} ignored as too far off the axis)')
+            return True
+        b = self.last_seen(r, now)[0]                                # ... but turn to where it was last SEEN (ignored poses too)
+        self.publish_head()
+        self.publish_cmd(0.0, 0.0, shape(b, p.kp_ang, p.w_min, p.w_max, 2 * p.yaw_tol), f'lost: no pose for {age:.1f}s')
+        self.heartbeat(r, self.geometry(est, r, *self.aim), f'lost the table {now - self.lost_t0:.0f}/{p.lost_timeout_s:.0f}s')
+        return True
 
     def latch_step(self, now, r):
         p = self.p
         self.publish_head()
+        if (not self.samples and self.edge and now - self.edge[0] <= p.stale_pose_s + p.window_s
+                and now - self.t_latch > p.latch_settle_s + p.stale_pose_s):
+            self.face_yaw = r[2] + self.last_seen(r, now)[0]   # only ignored (off-axis) poses: the table is not where the estimate
+            #                                                    put it. Turn to what the camera sees, so that its poses count
         turn, s = wrap(self.face_yaw - r[2]), None
         if abs(turn) > 2 * p.yaw_tol:            # stopped on the bisector but not facing the table: turn on the spot first
             self.latch_t0 = now + p.latch_settle_s    # the poses count from when it stands still and faces the table
@@ -628,10 +735,10 @@ class H2ArrivalNavigator(Node):
         self.get_logger().info(
             f'[HB] {self.phase.value}{leg} | {tab} | pelvis@odom=({r[0]:+.2f},{r[1]:+.2f},{math.degrees(r[2]):+.0f}) | '
             f'{geo} | {head} | pose age={age} n={len(self.samples)} | cmd=({c[0]:+.2f},{c[1]:+.2f},{c[2]:+.2f}) | '
-            f'rx={self.n_rx} acc={self.n_acc} rej={self.n_rej} tf_fail={self.n_tf_fail}' + (f' | {extra}' if extra else ''))
+            f'rx={self.n_rx} acc={self.n_acc} rej={self.n_rej} edge={self.n_edge} tf_fail={self.n_tf_fail}' + (f' | {extra}' if extra else ''))
 
     def log_counters(self):
-        self.get_logger().info(f'[STATS] poses rx={self.n_rx} accepted={self.n_acc} rejected={self.n_rej} tf_failed={self.n_tf_fail} '
+        self.get_logger().info(f'[STATS] poses rx={self.n_rx} accepted={self.n_acc} rejected={self.n_rej} off_axis_ignored={self.n_edge} tf_failed={self.n_tf_fail} '
                                f'latch_tries={self.tries}')
 
     def set_phase(self, phase):

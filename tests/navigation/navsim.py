@@ -60,11 +60,12 @@ class FakeTF:
 class Sim:
     def __init__(self, node, robot=(0.0, 0.0, 0.0), table=(3.8, 0.0, math.pi / 2), *, latency=0.3, vision_hz=10.0,
                  sigma=(0.02, math.radians(1.0)), tau=0.25, blocked_below=1.2, fov=math.radians(41), gaps=None,
-                 flip_prob=0.0, seed=0, dt=0.05):
+                 flip_prob=0.0, seed=0, dt=0.05, vision_range=5.0, edge=None):
         self.node, self.dt, self.tau, self.latency = node, dt, tau, latency
         self.table, self.sigma, self.blocked_below, self.fov = table, sigma, blocked_below, fov
         self.gaps, self.flip_prob, self.rng = gaps, flip_prob, np.random.default_rng(seed)
         self.vision_period = 1.0 / vision_hz
+        self.vision_range, self.edge = vision_range, edge       # edge = (deg, shift m, yaw error rad): a table centre further off the axis is only partly in the image: its pose is shifted toward the axis and its axis is wrong
         self.x, self.y, self.yaw = robot
         self.v, self.t, self.next_vision = np.zeros(3), 0.0, 0.0
         self.tf = node.tf_buffer = FakeTF()
@@ -105,7 +106,7 @@ class Sim:
         face = self.true_errors((x, y, th))[3]
         d = np.array([cx - x, cy - y])
         rel = np.array([math.cos(th) * d[0] + math.sin(th) * d[1], -math.sin(th) * d[0] + math.cos(th) * d[1]])
-        if (not self.vision_on or abs(math.atan2(rel[1], rel[0])) > self.fov or np.hypot(*d) > 5.0
+        if (not self.vision_on or abs(math.atan2(rel[1], rel[0])) > self.fov or np.hypot(*d) > self.vision_range
                 or face < self.blocked_below or (self.gaps and self.gaps(t_img))):
             return None
         n = np.array([-math.sin(phi), math.cos(phi)])
@@ -118,8 +119,13 @@ class Sim:
             if t0 <= t_img < t1:
                 off += b
         rel = rel + np.array([math.cos(th) * off[0] + math.sin(th) * off[1], -math.sin(th) * off[0] + math.cos(th) * off[1]])
+        partial = bool(self.edge) and abs(math.atan2(rel[1], rel[0])) > math.radians(self.edge[0])
+        if partial:
+            rel = rel - np.array([0.0, math.copysign(self.edge[1], rel[1])])
         rel = rel + self.rng.normal(0, self.sigma[0], 2)
         yaw = phi - math.pi / 2 - th + self.rng.normal(0, self.sigma[1])    # mesh Y = long axis, so the mesh frame is the axis rotated by -90 deg
+        if partial:
+            yaw += self.edge[2]
         if self.rng.random() < self.flip_prob:
             yaw += math.pi                                    # symmetric 180 deg flip about z
         m = helpers.MSG['PoseStamped']()
