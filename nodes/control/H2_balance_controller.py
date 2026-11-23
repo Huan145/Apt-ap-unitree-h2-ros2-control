@@ -36,10 +36,17 @@ HEAD PITCH OVERRIDE (same behaviour as h2_fullbody_controller.py):
   h2_fullbody_box_controller.py, e.g.
     ros2 topic pub -r 20 /head_pitch_cmd std_msgs/msg/Float64 "{data: 0.0}"
 
+ARM HOLD (switching with h2_control_mux.py): arm targets come from /arm_targets while it is
+fresh (a message in the last ARM_FRESH_S). Without it, the arms hold the arm values last APPLIED
+on --applied-topic (/joint_command = the mux output = what the previous controller commanded),
+so switching to this controller never moves the arms (box held by the box controller stays
+held). While this controller is the active one, that is its own last command -> the arms stay put.
+
 Subscribes: /joint_states (JointState), /imu (sensor_msgs/Imu, pelvis-mounted),
             /arm_targets (JointState, 14 arm joints),
             /load_expected (std_msgs/Bool, from the sequencer; False until received),
             /head_pitch_cmd (std_msgs/Float64, optional head override)
+            --applied-topic (/joint_command, JointState): arm values to hold without /arm_targets
 Publishes:  /joint_command (JointState, 31 joints, radians)
 
 Usage:
@@ -71,6 +78,7 @@ SIM_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=Durabili
 STALE_S = 0.1        # --clock wall: stop commanding if joint_states/imu are older than this (wall time)
 IMU_MAX_LAG_S = 0.02  # --clock stamp: skip a step if IMU and joint_states stamps are further apart (sim time)
 START_TOL = 0.1       # rad; warn if a joint starts further than this from the training start pose
+ARM_FRESH_S = 0.5     # wall s; /arm_targets older than this -> hold the last applied arm values
 HEAD_PITCH_JOINT = "head_pitch_joint"
 
 # <repo>/nodes/control/this_file.py -> <repo>/models/h2_balance_box_pickup/
@@ -83,7 +91,7 @@ def stamp_s(msg):
 
 
 class BalanceController(Node):
-    def __init__(self, policy_path, io_path, cmd_topic, arm_topic, imu_topic, ramp_s=0.0, hold_s=0.0,
+    def __init__(self, policy_path, io_path, cmd_topic, arm_topic, imu_topic, applied_topic, ramp_s=0.0, hold_s=0.0,
                  clock="stamp", head_topic="/head_pitch_cmd", head_min=-0.5, head_max=0.7,
                  head_rate=0.5, head_timeout=1.0):
         super().__init__("h2_balance_controller")
@@ -125,6 +133,9 @@ class BalanceController(Node):
         self.ang_vel, self.gravity_b = np.zeros(3), np.array([0.0, 0.0, -1.0])
         self.last_action = np.zeros(len(self.act_names))
         self.arm_target = None
+        self.t_arm = None                            # wall time of the last /arm_targets message
+        self.applied_arm = None                      # arm values last seen on applied_topic
+        self.arm_holding = False                     # True while holding applied_arm (no fresh /arm_targets)
         self.load_expected = 0.0
         self.t_joints = self.t_imu = None            # wall time of last message
         self.stamp_imu = None                        # sim/robot time (header stamp) of last IMU message
@@ -156,6 +167,7 @@ class BalanceController(Node):
             self.create_subscription(Imu, imu_topic, self.cb_imu, SIM_QOS)
             self.create_timer(1.0 / self.hz, self.tick)
         self.create_subscription(JointState, arm_topic, self.cb_arm, 10)
+        self.create_subscription(JointState, applied_topic, self.cb_applied, SIM_QOS)
         self.create_subscription(Bool, "/load_expected", self.cb_flag, 10)
         if self.head_act_i is None:
             self.get_logger().warn(f"{HEAD_PITCH_JOINT} is not a policy joint - head override disabled")
@@ -253,6 +265,26 @@ class BalanceController(Node):
         idx = {name: i for i, name in enumerate(msg.name)}
         if all(j in idx for j in self.arm_names):
             self.arm_target = np.array([msg.position[idx[j]] for j in self.arm_names])
+            self.t_arm = time.monotonic()
+
+    def cb_applied(self, msg):
+        """Arm values the robot is actually being commanded (mux output / own command)."""
+        idx = {name: i for i, name in enumerate(msg.name)}
+        if all(j in idx for j in self.arm_names):
+            self.applied_arm = np.array([msg.position[idx[j]] for j in self.arm_names])
+
+    def update_arm_source(self):
+        """Fresh /arm_targets -> follow them; otherwise hold the last applied arm values."""
+        fresh = self.t_arm is not None and time.monotonic() - self.t_arm <= ARM_FRESH_S
+        if fresh or self.applied_arm is None:
+            if self.arm_holding and fresh:
+                self.get_logger().info("[ARMS] following /arm_targets")
+            self.arm_holding = False
+            return
+        if not self.arm_holding:
+            self.get_logger().info("[ARMS] no /arm_targets - holding the last applied arm command")
+            self.arm_holding = True
+        self.arm_target = self.applied_arm.copy()
 
     # ── Control step ────────────────────────────────────────────────────────
 
@@ -301,6 +333,7 @@ class BalanceController(Node):
             self.startup_step(now)
             if not self.policy_active:
                 return
+        self.update_arm_source()
 
         obs = np.concatenate([np.asarray(f(), dtype=np.float32).ravel() for _, _, f in self.builders])
         with torch.no_grad():
@@ -322,6 +355,8 @@ class BalanceController(Node):
         self.policy_active = False
         self.last_action[:] = 0.0
         self.arm_target = None
+        self.t_arm = self.applied_arm = None
+        self.arm_holding = False
         self.load_expected = 0.0
         self.head_override, self.head_need_init, self.head_target, self.head_last_t = False, False, None, None
 
@@ -370,6 +405,8 @@ def main():
     p.add_argument("--cmd-topic", default="/joint_command", help="whole-body command topic the sim/robot listens on")
     p.add_argument("--arm-topic", default="/arm_targets")
     p.add_argument("--imu-topic", default="/imu", help="pelvis IMU (sensor_msgs/Imu)")
+    p.add_argument("--applied-topic", default="/joint_command",
+                   help="what the robot is actually commanded (mux output); arms hold these values without /arm_targets")
     p.add_argument("--ramp", type=float, default=0.0,
                    help="optional startup: seconds to ease into the training default pose (0 = off)")
     p.add_argument("--hold", type=float, default=0.0,
@@ -389,7 +426,7 @@ def main():
             raise SystemExit(f"Not found: {path}\nCopy policy.pt and policy_io.json from the same run into {MODEL_DIR}")
 
     rclpy.init()
-    node = BalanceController(args.policy, args.io, args.cmd_topic, args.arm_topic, args.imu_topic,
+    node = BalanceController(args.policy, args.io, args.cmd_topic, args.arm_topic, args.imu_topic, args.applied_topic,
                              ramp_s=args.ramp, hold_s=args.hold, clock=args.clock,
                              head_topic=args.head_topic, head_min=args.head_min, head_max=args.head_max,
                              head_rate=args.head_rate, head_timeout=args.head_timeout)
