@@ -43,11 +43,19 @@ on --applied-topic (/joint_command = the mux output = what the previous controll
 so switching to this controller never moves the arms (box held by the box controller stays
 held). While this controller is the active one, that is its own last command -> the arms stay put.
 
+STANDBY / SWITCH (--standby, as h2_fullbody_freebox_controller.py): the node runs from the start
+but runs NO policy step and commands nothing until h2_control_mux.py reports "balance" on
+/control_mode_active (latched). Then it starts fresh (last action 0, as at a training episode
+start; arms hold the last applied command, i.e. what the previous controller was doing) and
+commands from its next step. Anything else -> standby again (policy stops; state is not carried).
+  python3 H2_balance_controller.py --standby --cmd-topic /joint_command_balance
+
 Subscribes: /joint_states (JointState), /imu (sensor_msgs/Imu, pelvis-mounted),
             /arm_targets (JointState, 14 arm joints),
             /load_expected (std_msgs/Bool, from the sequencer; False until received),
             /head_pitch_cmd (std_msgs/Float64, optional head override)
             --applied-topic (/joint_command, JointState): arm values to hold without /arm_targets
+            --mode-topic (/control_mode_active, std_msgs/String, latched): with --standby
 Publishes:  /joint_command (JointState, 31 joints, radians)
 
 Usage:
@@ -70,11 +78,13 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Imu, JointState
-from std_msgs.msg import Bool, Float64
+from std_msgs.msg import Bool, Float64, String
 
 # Same as h2_fullbody_controller.py (proven with this sim): reliable, keep every message
 SIM_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE,
                      history=HistoryPolicy.KEEP_ALL)
+LATCHED = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                     history=HistoryPolicy.KEEP_LAST, depth=1)
 
 STALE_S = 0.1        # --clock wall: stop commanding if joint_states/imu are older than this (wall time)
 IMU_MAX_LAG_S = 0.02  # --clock stamp: skip a step if IMU and joint_states stamps are further apart (sim time)
@@ -94,8 +104,10 @@ def stamp_s(msg):
 class BalanceController(Node):
     def __init__(self, policy_path, io_path, cmd_topic, arm_topic, imu_topic, applied_topic, ramp_s=0.0, hold_s=0.0,
                  clock="stamp", head_topic="/head_pitch_cmd", head_min=-0.5, head_max=0.7,
-                 head_rate=0.5, head_timeout=1.0):
+                 head_rate=0.5, head_timeout=1.0, standby=False, mode_topic="/control_mode_active",
+                 mode_name="balance"):
         super().__init__("h2_balance_controller")
+        self.active, self.mode_name = not standby, mode_name   # STANDBY: no policy steps until the mux says so
         self.ramp_s, self.hold_s, self.clock = ramp_s, hold_s, clock
         self.startup_q = self.startup_t0 = None
         self.policy_active = False
@@ -175,6 +187,8 @@ class BalanceController(Node):
         else:
             self.create_subscription(Float64, head_topic, self.cb_head, 10)
         self.pub = self.create_publisher(JointState, cmd_topic, SIM_QOS)
+        if standby:
+            self.create_subscription(String, mode_topic, self.cb_mode, LATCHED)
 
         self.get_logger().info(
             f"Policy {policy_path} | obs {self.obs_dim} = " + " + ".join(f"{n}({d})" for n, d in self.obs_terms)
@@ -182,7 +196,8 @@ class BalanceController(Node):
             + ("of /joint_states stamp time (sim time in Isaac Sim)" if clock == "stamp" else "wall clock")
             + f" -> {cmd_topic}"
             + (f" | head override on {head_topic} [{self.head_min:+.2f},{self.head_max:+.2f}] rad, "
-               f"{self.head_rate} rad/s, timeout {self.head_timeout}s" if self.head_act_i is not None else ""))
+               f"{self.head_rate} rad/s, timeout {self.head_timeout}s" if self.head_act_i is not None else "")
+            + ("" if self.active else f" | STANDBY until '{mode_name}' on {mode_topic}"))
 
     # ── Inputs ──────────────────────────────────────────────────────────────
 
@@ -210,6 +225,22 @@ class BalanceController(Node):
         self.ang_vel = np.array([w.x, w.y, w.z])
         self.t_imu = time.monotonic()
         self.stamp_imu = stamp_s(msg)
+
+    def cb_mode(self, msg):
+        """STANDBY: own mode name -> take control with a fresh state; anything else -> standby."""
+        want = msg.data.strip().lower() == self.mode_name
+        if want and not self.active:
+            self.last_action[:] = 0.0                  # fresh start, as at a training episode start
+            self.next_step = None
+            self.arm_holding = False                   # re-log which arm source is used
+            self.head_override, self.head_need_init, self.head_target, self.head_last_t = False, False, None, None
+            self.active = True
+            self.get_logger().info(f"[MODE] balance policy TAKES CONTROL (fresh state)")
+            if self.policy_active:
+                self.check_start_pose()
+        elif not want and self.active:
+            self.active = False
+            self.get_logger().info(f"[MODE] '{msg.data}' -> balance policy in STANDBY (no policy steps, not commanding)")
 
     def cb_flag(self, msg):
         if msg.data and not self.load_expected:
@@ -328,6 +359,8 @@ class BalanceController(Node):
 
     def control_step(self, now):
         """One policy step at time `now` (stamp or wall time, per --clock)."""
+        if not self.active:                            # STANDBY: measure only (callbacks), command nothing
+            return
         if self.startup_q is None:
             self.check_start_pose()
         if not self.policy_active:
@@ -417,6 +450,10 @@ def main():
     p.add_argument("--clock", choices=["stamp", "wall"], default="stamp",
                    help="stamp (default): step on /joint_states header time = sim time in Isaac Sim, correct at any "
                         "real-time factor; wall: fixed wall-clock timer")
+    p.add_argument("--standby", action="store_true",
+                   help="wait for --mode-name on --mode-topic before running the policy (use with h2_control_mux.py)")
+    p.add_argument("--mode-topic", default="/control_mode_active", help="latched std_msgs/String from h2_control_mux.py")
+    p.add_argument("--mode-name", default="balance", help="the mux mode that gives this node control")
     p.add_argument("--head-topic", default="/head_pitch_cmd", help="std_msgs/Float64 head pitch override (rad)")
     p.add_argument("--head-min", type=float, default=-0.5, help="head override lower clamp (rad) - check URDF limits")
     p.add_argument("--head-max", type=float, default=0.7, help="head override upper clamp (rad) - check URDF limits")
@@ -432,7 +469,8 @@ def main():
     node = BalanceController(args.policy, args.io, args.cmd_topic, args.arm_topic, args.imu_topic, args.applied_topic,
                              ramp_s=args.ramp, hold_s=args.hold, clock=args.clock,
                              head_topic=args.head_topic, head_min=args.head_min, head_max=args.head_max,
-                             head_rate=args.head_rate, head_timeout=args.head_timeout)
+                             head_rate=args.head_rate, head_timeout=args.head_timeout,
+                             standby=args.standby, mode_topic=args.mode_topic, mode_name=args.mode_name)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
