@@ -91,8 +91,9 @@ PARAMS = dict(
     latch_timeout_s=20.0,       # s (tracker gaps of 2-9 s were seen)
     # scan
     scan_wait_s=3.0, scan_w=0.70, scan_dir=1.0, scan_max_deg=400.0, min_samples=3,
-    scan_center_deg=8.0,        # the scan turns until the table centre is this close to the camera axis, then stands still
-    scan_settle_s=8.0,          # s standing still with the table in view; after that go on with what there is
+    scan_center_deg=15.0,       # the scan turns until the table centre is this close to the camera axis, then hands over
+                                #    (at 5.5 m the whole table is only +-13 deg wide; poses at that range are too jumpy to wait for)
+    scan_hold_s=6.0,            # s standing still after the poses stop (the tracker has gaps of 2-4 s) before sweeping on
     # which poses count: the table centre must be within view_limit() of the camera axis (a table at the image edge is
     # only partly visible and its pose comes out wrong: axis +76 deg instead of 0, centre 0.8 m off, Nov 23)
     fov_half_deg=41.0, view_margin_deg=4.0, view_min_deg=10.0,
@@ -207,7 +208,7 @@ class H2ArrivalNavigator(Node):
         self.head_target = self.head_cmd = self.head_err = None
         self.last_cmd, self.last_hb = (0.0, 0.0, 0.0), None
         self.n_rx = self.n_acc = self.n_rej = self.n_tf_fail = self.n_edge = 0
-        self.lost_t0 = self.lost_n0 = self.scan_t0 = None   # table lost since / poses then / table in view since (scan)
+        self.lost_t0 = self.lost_n0 = None   # table lost since / poses then
         self.edge = None                           # (image time, x, y in odom) of the newest pose ignored for being too far off the axis
 
     # ---------------- time, TF ----------------
@@ -615,25 +616,21 @@ class H2ArrivalNavigator(Node):
                              f'/active_target "workstation" and {p.pose_topic} published?')
         self.publish_head()
         wz, status = 0.0, f'scan: {len(self.samples)} poses'
-        if self.samples and now - self.samples[-1][0] <= p.stale_pose_s + p.window_s:   # the table has been well in view
-            self.scan_t0 = now if self.scan_t0 is None else self.scan_t0
+        if self.samples and now - self.samples[-1][0] <= p.scan_hold_s:    # the table has been well in view (lately)
+            self.scanned = 0.0                                             # the sweep budget counts only the turning since then
             est = self.estimate()
             b = wrap(math.atan2(est[1] - r[1], est[0] - r[0]) - r[2])      # where the table centre is now (odometry)
-            settled = self.stable() is not None
             if abs(math.degrees(b)) > p.scan_center_deg:                  # the turn overshot (or the table is off to a side): centre it
                 wz, status = shape(b, p.kp_ang, p.w_min, p.w_max, math.radians(p.scan_center_deg)), f'scan: centring the table, {math.degrees(b):+.0f} deg'
-                self.scan_t0 = now
-            elif settled or (now - self.scan_t0 > p.scan_settle_s and len(self.samples) >= p.min_samples):
+            elif len(self.samples) >= p.min_samples:                      # the stable check is the latch's job, at 2 m
                 self.get_logger().info(
-                    f'[SCAN] table found after {now - self.t_start:.1f}s, turned {math.degrees(self.scanned):.0f} deg, centre '
-                    f'{math.degrees(b):+.0f} deg off the camera axis'
-                    + ('' if settled else f' (poses never settled in {p.scan_settle_s}s: {self.latch_status()})'))
+                    f'[SCAN] table found after {now - self.t_start:.1f}s, {len(self.samples)} poses, centre '
+                    f'{math.degrees(b):+.0f} deg off the camera axis ({self.latch_status()})')
                 self.set_phase(Phase.ROTATE)
                 return self.publish_cmd(0.0, 0.0, 0.0, 'table found')
             else:
-                status = 'scan: table in view, waiting for its pose to settle: ' + self.latch_status()
+                status = f'scan: table in view, waiting for {p.min_samples} poses'
         else:
-            self.scan_t0 = None
             if self.edge and now - self.edge[0] <= p.stale_pose_s + p.window_s:     # seen, but too far off the axis: turn to it
                 b = self.last_seen(r, now)[0]
                 wz, status = math.copysign(p.scan_w, b), f'scan: table at the image edge ({math.degrees(b):+.0f} deg), turning to it'
@@ -654,7 +651,7 @@ class H2ArrivalNavigator(Node):
             self.get_logger().info(f'[LOST] table seen again after {now - self.lost_t0:.1f}s')
             self.lost_t0 = None
         if self.lost_t0 is None:
-            if age <= p.stale_pose_s or abs(math.degrees(b)) > self.view_limit(math.hypot(dx, dy)):
+            if age <= p.stale_pose_s or abs(math.degrees(b)) > self.view_limit(math.hypot(dx, dy)) - p.view_margin_deg:   # (not at the very edge of the gate)
                 return False
             self.lost_t0, self.lost_n0 = now, self.n_acc
             self.get_logger().warn(f'[LOST] no pose for {age:.1f}s although the table should be in view '

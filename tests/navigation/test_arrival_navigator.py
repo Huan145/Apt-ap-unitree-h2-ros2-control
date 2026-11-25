@@ -662,7 +662,7 @@ def displaced(until, by=1.5):
 
 
 def test_a_corrected_estimate_after_merging_sends_it_back_to_the_meet_leg_and_the_latch_is_on_the_true_line():
-    n, sim, _, phase = run_nominal(hooks=[displaced(12.0)])
+    n, sim, _, phase = run_nominal(table=(7.0, 0.0, math.pi / 2), vision_range=9.0, hooks=[displaced(11.0)])   # far: the correction comes while it walks
     assert phase == 'succeeded', result(n)
     assert n.log.has('info', 'meet leg again') and abs(result(n)['latched_off_m']) < 0.4
     dx, dy, dyaw, face = sim.true_errors()
@@ -679,14 +679,14 @@ def test_a_wrong_estimate_with_the_real_table_visible_off_the_axis_is_corrected_
         assert math.hypot(dx, dy) < 0.10 and abs(dyaw) < math.radians(7), until
 
 
-def test_scan_stands_still_until_the_poses_are_settled_not_after_the_first_three():
+def test_scan_waits_for_3_poses_then_hands_over_without_waiting_for_them_to_settle():
     n = make()
     sim = Sim(n, robot=(0.0, 0.0, 0.0), table=(5.0, 0.0, math.pi / 2), vision_range=9.0)
     start(n)
     sim.run(until=lambda s: len(n.samples) >= 3)
     assert n.phase is nav.Phase.SCAN and cmd(n)[2] == 0.0              # the table is in view: stand still and wait
     sim.run(until=lambda s: n.phase is not nav.Phase.SCAN)
-    assert n.phase is nav.Phase.ROTATE and len(n.samples) >= n.p.latch_samples
+    assert n.phase is nav.Phase.ROTATE and len(n.samples) >= n.p.min_samples
 
 
 def blocked_run(wall, **params):
@@ -719,3 +719,39 @@ def test_a_table_that_does_not_block_is_not_reported_as_blocked():
 def test_blocked_in_the_last_stretch_but_more_than_10_cm_short_fails():
     n, sim = blocked_run(wall=0.23)                          # final_align is entered, but the end point is 13 cm further
     assert n.phase.value == 'failed' and 'blocked' in result(n)['reason'] and sim.t < 150.0
+
+
+def scan_node():
+    n = make()
+    n.reset_run()
+    n.phase = nav.Phase.SCAN
+    n.get_clock().t, n.t_start = 10.0, 0.0
+    n.samples.append((10.0, 5.0, 0.0, math.pi / 2))           # one pose of a table 5 m ahead, in the centre of the image
+    return n
+
+
+def test_the_scan_hands_over_at_long_range_even_when_the_poses_jump_around():
+    n = make()
+    sim = Sim(n, robot=(0.0, 0.0, 0.0), table=(5.5, 0.0, math.pi / 2), vision_range=9.0, sigma=(0.6, math.radians(12)))
+    start(n)
+    sim.run(until=lambda s: n.phase is not nav.Phase.SCAN, limit=20.0)
+    assert n.phase is nav.Phase.ROTATE and sim.t < 5.0 and n.log.has('info', '[SCAN] table found')
+
+
+def test_the_sweep_budget_counts_only_the_turning_since_the_table_was_last_seen():
+    n = scan_node()
+    n.scanned = math.radians(399.0)
+    n.scan_step(10.0, (0.0, 0.0, 0.0))                          # the table is in view: the budget starts again
+    assert n.scanned == 0.0 and n.phase is nav.Phase.SCAN
+    n.samples.clear()
+    n.scanned = math.radians(401.0)
+    n.scan_step(20.0, (0.0, 0.0, 0.0))                          # nothing seen for the whole sweep: now it fails
+    assert n.phase is nav.Phase.FAILED and 'table not found' in result(n)['reason']
+
+
+def test_the_scan_stands_still_for_scan_hold_s_after_the_poses_stop_and_then_sweeps_on():
+    n = scan_node()
+    n.scan_step(14.0, (0.0, 0.0, 0.0))                          # 4 s after the last pose (a tracker gap)
+    assert cmd(n) == (0.0, 0.0, 0.0)
+    n.scan_step(17.0, (0.0, 0.0, 0.0))                          # 7 s: it is gone, sweep (the 3 s wait since the start is over)
+    assert cmd(n)[2] == pytest.approx(n.p.scan_w * n.p.scan_dir)

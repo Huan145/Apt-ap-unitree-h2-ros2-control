@@ -19,11 +19,13 @@ SCAN ─► ROTATE/APPROACH leg "meet"  ──(within 0.4 m of the bisector)─�
 
 ## The approach (what the robot does, in order)
 
-1. **SCAN.** No table yet: stand 3 s, then turn left at 0.7 rad/s (gives up after 400°). It does **not** stop at the first
-   poses: those often come with the table at the image edge and are wrong (Nov 23). It keeps turning until the table
-   centre is within `scan_center_deg` (8°) of the camera axis, then stands still until the poses are stable (the same
-   rule as the latch) or `scan_settle_s` (8 s) have passed. A pose ignored by the view gate (below) still turns it
-   towards the table.
+1. **SCAN.** No table yet: stand 3 s, then turn left at 0.7 rad/s (fails after `scan_max_deg` 400° of turning **since the
+   table was last seen**: centring turns do not count). It does not stop at the first poses (Nov 23: partial-view poses
+   are wrong; the view gate below now ignores those). It keeps turning until the table centre is within `scan_center_deg`
+   (15°) of the camera axis and ≥ 3 poses are accepted, then hands over. It does **not** wait for stable poses: at
+   5 to 6 m the estimate jumps by up to 2 m along the table (Nov 25), and the latch at 2 m is the stable check. After the
+   poses stop (tracker gaps of 2 to 4 s) it stands still for `scan_hold_s` (6 s) before sweeping on. A pose ignored by
+   the view gate (below) still turns it towards the table.
 2. **Meet leg.** If the robot is more than `line_tol` (0.4 m) off the bisector it walks to the **meet point**: on the
    bisector, `meet_dist` (3.0 m) from the table face, aiming at it only (no squaring to the table on the way). The
    robot is always on its own side of the table; beside the table's long-axis plane (±0.5 m) it keeps the side it chose
@@ -91,7 +93,7 @@ stopped scanning on them, walked on a frozen wrong estimate and lost the table.
    smaller the angle at which its ends are still inside the image. An ignored pose still aims the head and is
    remembered (`edge`) as the direction to turn to. It is never used to steer. After the latch the gate is off.
 2. **Lost guard.** No accepted pose for `stale_pose_s` (1.5 s; normal pose age is 0.3 to 0.8 s) **and** the estimate
-   says the table should be in view (its bearing is within the view limit): stop, and turn towards the last place the
+   says the table should be in view (its bearing is at least `view_margin_deg` inside the view limit, so a table at the very edge of the gate is not "lost"): stop, and turn towards the last place the
    table was seen (accepted or ignored pose) until poses return (`[LOST] ... seen again after 4.2s`). After
    `lost_timeout_s` (12 s) it fails with `table lost: no pose for N s ...`. The guard does **not** act when the estimate
    says the table is out of view: the meet leg walks that way on purpose, on odometry.
@@ -174,7 +176,7 @@ ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{}"
 | `latch_pos_tol`, `latch_yaw_tol` | 0.05 m, 3° | how well the two halves must agree |
 | `max_range` | 9.0 | m, poses further than this are rejected. Needs `max_depth` 10.0 in the FoundationPose launch (see `target_switching.md`) |
 | `scan_wait_s`, `scan_w`, `scan_dir` | 3.0, 0.70, +1 | stand still, then turn left at 0.7 rad/s; fails after `scan_max_deg` 400 |
-| `scan_center_deg`, `scan_settle_s` | 8.0, 8.0 | SCAN turns until the table centre is this close to the camera axis, then waits for stable poses at most this long |
+| `scan_center_deg`, `scan_hold_s` | 15.0, 6.0 | SCAN turns until the table centre is this close to the camera axis, then hands over; it stands still this long (s) after the poses stop before sweeping on |
 | `fov_half_deg`, `view_margin_deg`, `view_min_deg` | 41, 4, 10 | view gate: poses further off the camera axis than `max(fov_half − margin − atan(L/2 / dist), view_min)` are ignored. 41° is the camera's half FOV |
 | `stale_pose_s`, `lost_timeout_s` | 1.5, 12 | lost guard: stand still after this long without a pose (if the table should be in view), fail after the second |
 | `unmerge_tol` | 0.8 | m, further off the bisector than this sends the robot back to the meet leg |
@@ -204,7 +206,7 @@ success carries `face_dist_m` (pelvis → table face, what the place step needs)
 
 ## Tests
 
-`pytest tests` (110 in all; 64 in `tests/navigation`, no ROS needed). They drive the node in a small kinematic world
+`pytest tests` (113 in all; 67 in `tests/navigation`, no ROS needed). They drive the node in a small kinematic world
 (`navsim.py`): velocity lag 0.25 s, vision 0.3 s late and noisy, camera blind below 1.2 m, tracker gaps, 180° flips,
 a re-estimation jump inside the latch window, odometry loss, partial-view errors at the image edge (`edge=`), a limited
 vision range (`vision_range=`), a table that stops the body (`wall=`: the pelvis cannot get closer than this to the face). They check arrival within 8 cm / 6° of the goal (10 cm / 7°
@@ -214,7 +216,7 @@ the outside and approached at a long face; a start on the bisector does not deto
 stands, turned away it turns on the spot first, off the line it joins the line first; the range is the distance to the
 face, not to its plane (the Nov 22 trigger bug); the end point without a latch fails; the live pose is logged but not
 used; no ±0.25 turn-rate kicks while walking in; the heading holds after a sideways slip next to the table; no turn command below what the policy responds to; zero
-velocity for the whole pause after every phase change. For Nov 23: SCAN does not stop at the first poses, poses at the
+velocity for the whole pause after every phase change. For Nov 23: SCAN hands over at 5.5 m with poses that jump by 0.6 m / 12° without waiting for stability, the sweep budget counts only the turning since the table was last seen, it stands still for `scan_hold_s` after the poses stop, poses at the
 image edge are ignored while the robot walks with the table off to the side, a start beside the table with partial-view
 errors succeeds with the gate and fails without it, the robot stands still when the table should be in view but no pose
 comes (and fails with the reason if it does not come back), a corrected estimate after merging sends it back to the meet
@@ -227,7 +229,7 @@ distance as range, no on-the-line condition in the trigger, no turn before the l
 window, no side memory, no lookahead, no bearing fade, no guard against success without a latch, a latch timeout that
 ignores the turn, …) and 8 on the view guard (no view gate, SCAN stopping at the first 3 poses, no lost guard, a lost guard
 that also fires when the table is out of view on purpose, turning to the estimate only, no turn to ignored poses in the
-latch, no unmerge, a lost guard that never gives up) and 5 on the blocked check (no check, accepting at any distance, the progress never resetting
+latch, no unmerge, a lost guard that never gives up) and 3 on the SCAN hand-over (waiting for stable poses, a sweep budget that never resets, a 2.5 s hold) and 5 on the blocked check (no check, accepting at any distance, the progress never resetting
 the push time, the check also before the latch, success without the `blocked` flag).
 
 ## Runs so far
@@ -251,6 +253,13 @@ the push time, the check also before the latch, success without the `blocked` fl
   face (median 0.16), blocked by the table (seen in the sim). `final_align` kept pushing, with a ±4° yaw wobble and ±5 cm
   lateral sway from the stepping, until the run timeout: the goal was 9 cm ahead, the tolerance ±5 cm. Fixed by standoff
   0.10 plus the blocked check; the 0.15 m is where the table stops the body, so the end now counts as reached when blocked.
+
+- **Fifth run (Nov 25).** Started 5.6 m from the table. It turned to it and centred it, but the SCAN waited for stable poses
+  that never came: at that range `x` along the table jumped between -1.0 and +2.2 m (real: 0.78) and the axis between -11° and
+  +16° (halves differ 79 mm to 2 m, 50 mm allowed), the centring chased the jumps (+12, -8, +13, -24°), poses stopped for
+  2 to 4 s (the 2.5 s limit made it sweep away), and the 400° limit counted the back-and-forth: "table not found after
+  turning 401 deg" with 413 poses accepted. Fixed by the three SCAN changes above. Suspected, not checked: the selector's
+  full re-estimation every `reset_period` (5000 ms) causes the jumps and gaps; try 20000 in the launch file.
 
 **Not verified** (no ROS, GPU or robot here): real tracker noise and lag, whether 10 m of `max_depth` fixes the axis,
 how the free-box policy follows `cmd_vel` with the head tilted, the carry height over the table (the box front ends 0.25 m over it), what exactly touches the table at 0.15 m (box, hands or feet: not looked at), how the policy follows the 0.65 rad/s minimum turn rate (hunting in FINAL_ALIGN, yaw tolerance 4°), the real tracker behaviour at the view limit, the real pose-age distribution behind `stale_pose_s`, and `main()` on a real
