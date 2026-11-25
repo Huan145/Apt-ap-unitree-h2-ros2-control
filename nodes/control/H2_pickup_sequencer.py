@@ -40,10 +40,18 @@ be back in control first: /controller_select "balance"):
               so the arms swing down beside the body, behind the table edge, not through the table
  12 home      joint space to HOME_POSE = arm defaults of UNITREE_H2_CFG (walking + balance policies)
  13 done      hold HOME_POSE -> hand over to the no-box walking controller
---place-only: start at 'lower' with the robot already holding the box (no pickup, no FoundationPose
-  targets), e.g. after h2_fullbody_box_controller -> balance controller via the mux. The arms start
-  from the arm command currently APPLIED on --applied-topic (/joint_command, the one holding the
-  box), so the grip does not change at the hand-over; box-weight compensation on from the start.
+--place-only: the robot already holds the box (no pickup, no FoundationPose targets); box-weight
+  compensation on from the start.
+  --from applied (default, after a mux switch): plan from the MEASURED arms and keep the command
+            APPLIED now on --applied-topic (/joint_command, the one holding the box) as a constant
+            joint offset on top: grip = applied - (measured + compensation). The first /arm_targets
+            equals the applied command, the grip holds while lowering and fades out during unload.
+            (A policy grips by commanding the hands far past the box faces - planning from that
+            command would put the hands somewhere they cannot be.)
+  --from measured (fresh start / nothing holding the box): start from the MEASURED arms with the
+            gravity + box compensation ON TOP (lifts the sagging arms), then
+    grip    hands in by --grip-squeeze (3 cm) to press the box.
+  --wait    hold there until /sequencer_cmd "place" (else lower straight away).
 load_expected stays True from carry to the end ("flag 1, no load" is in the training distribution;
 1 -> 0 never happens in training).
 
@@ -153,13 +161,13 @@ HOME_POSE_DICT.update({"left_shoulder_pitch_joint": 0.28, "right_shoulder_pitch_
                        "left_shoulder_roll_joint": 0.16, "right_shoulder_roll_joint": -0.16,
                        "left_elbow_joint": 0.52, "right_elbow_joint": 0.52})
 # Phase machine
-PHASES = ["wide", "standoff", "pinch", "tilt", "carry", "hold",
+PHASES = ["wide", "standoff", "pinch", "tilt", "carry", "grip", "hold",   # grip: --place-only --from measured
           "lower", "unload", "release", "retract", "clear", "home", "done"]
-PATHS = {"carry", "lower", "release"}     # straight Cartesian paths through CARRY_STEPS IK knots
+PATHS = {"carry", "grip", "lower", "release"}     # straight Cartesian paths through CARRY_STEPS IK knots
 WAIT = {"hold", "done"}                   # no move; hold waits for /sequencer_cmd "place"
 LIVE = {"standoff"}                       # replanned (after the current move) when the target moved
 RETRY = {"wide", "standoff", "pinch"}     # an IK-rejected arm retries on the next target update
-CONTACT = {"pinch", "tilt", "carry", "lower", "unload", "release"}   # may be blocked -> end after CONTACT_TIMEOUT_S
+CONTACT = {"pinch", "tilt", "carry", "grip", "lower", "unload", "release"}   # may be blocked -> end after CONTACT_TIMEOUT_S
 CONTACT_TIMEOUT_S = 1.0
 WARN_EVERY_S = 2.0
 WAIT_TIMEOUT_S = 10.0
@@ -255,7 +263,10 @@ class PickupSequencer(Node):
         self.create_subscription(String, "/sequencer_cmd", self.cb_cmd, 10)
         self.flag_pub = self.create_publisher(Bool, "/load_expected", 10)
         self.applied = None                # --place-only: arm command applied now, {"L": (7,), "R": (7,)}
-        if args.place_only:
+        self.measured_start = args.place_only and args.start_from == "measured"
+        self.comp_t0 = None                # --from measured: the whole compensation fades in from here
+        self.grip_delta = None             # --from applied: (14,) applied - (measured + compensation)
+        if args.place_only and not self.measured_start:
             self.create_subscription(JointState, args.applied_topic, self.cb_applied, SIM_QOS)
 
     def log(self, s, warn=False):
@@ -278,8 +289,9 @@ class PickupSequencer(Node):
         need_targets = not self.a.place_only
         if self.a.place_only:
             self.get_logger().info(f"--place-only: also waiting for the applied arm command on {self.a.applied_topic}")
+        need_applied = self.a.place_only and not self.measured_start
         while rclpy.ok() and (self.joint_state is None or (need_targets and None in self.targets.values())
-                              or (self.a.place_only and self.applied is None)):
+                              or (need_applied and self.applied is None)):
             rclpy.spin_once(self, timeout_sec=0.1)
             if time.time() - t0 > WAIT_TIMEOUT_S and not self.a.place_only:   # --place-only: started before Play
                 missing = [n for n, v in [(js, self.joint_state), ("/target_pose_left", self.targets["L"]),
@@ -473,6 +485,8 @@ class PickupSequencer(Node):
             return p + [self.a.place_dx, 0.0, dz], R
         u = (pl - pr) * [1, 1, 0]
         u /= np.linalg.norm(u)
+        if self.name == "grip":      # press the box: hands in from where they are
+            return p - arm.sign * self.a.grip_squeeze * u, R
         if self.name == "release":   # straight out along the grip axis, the pinch reversed
             return p + arm.sign * (GRASP_REACH_M + self.a.squeeze) * u, R
         xyz = self.a.clear if self.name == "clear" else self.a.wide     # retract: wide pose / clear
@@ -501,7 +515,7 @@ class PickupSequencer(Node):
             return
         arm.planned_for = self.targets[arm.side]
         arm.busy = True
-        goal = self.place_goal(arm) if self.phase > PHASES.index("hold") else self.phase_goal(arm)
+        goal = self.place_goal(arm) if self.phase >= PHASES.index("grip") else self.phase_goal(arm)
         arm.thread = threading.Thread(target=self.plan, args=(arm, self.name, self.base_q(), goal), daemon=True)
         arm.thread.start()
 
@@ -552,14 +566,22 @@ class PickupSequencer(Node):
             arm.q_cmd = np.array([meas[n] for n in arm.names])
         self.now = self.t_start = stamp_s(self.joint_state) if self.a.clock == "stamp" else time.monotonic()
         self.started = True
-        if self.a.place_only:      # holding the box already: full load from the start, then lower
-            self.phase = PHASES.index("lower")
+        if self.a.place_only:      # holding the box already: full load from the start
             self.load_t0 = self.now - LOAD_RAMP_S
-            self.take_over_applied()
-            self.log(f"--place-only: box weight {self.a.box_mass:.1f} kg compensated from the start")
+            self.place_requested = not self.a.wait          # hold waits for /sequencer_cmd place
+            if self.measured_start:    # measured arms + compensation on top (faded in), then grip
+                self.comp_t0 = self.now
+                self.phase = PHASES.index("grip" if self.a.grip_squeeze > 0 else "hold")
+                self.log("--place-only --from measured: arms lifted by the gravity + box compensation")
+            else:
+                self.phase = PHASES.index("hold")
+                self.take_over_applied()
+            self.log(f"--place-only: box weight {self.a.box_mass:.1f} kg compensated from the start"
+                     + (" | waiting for /sequencer_cmd place" if self.a.wait else ""))
             self.log(f"-> phase {self.phase + 1}: {self.name}")
-            for arm in self.arms:
-                self.start_plan(arm)
+            if self.name not in WAIT:
+                for arm in self.arms:
+                    self.start_plan(arm)
             if self.a.clock == "wall":
                 self.create_timer(1.0 / CONTROL_HZ, lambda: self.tick(time.monotonic()))
             return
@@ -574,21 +596,28 @@ class PickupSequencer(Node):
             self.create_timer(1.0 / CONTROL_HZ, lambda: self.tick(time.monotonic()))
 
     def take_over_applied(self):
-        """--place-only: start from the arm command applied right now (it holds the box), so the first
-        published target equals it: q_cmd + gravity_offset(q_cmd) == applied (fixed point, 3 iterations)."""
+        """--place-only --from applied: plan from the MEASURED arms (q_cmd, set in start()) and keep the
+        applied command's grip as a joint offset: grip_delta = applied - (measured + compensation), so the
+        first published target equals the applied command exactly."""
         if self.applied is None:
             self.log(f"no arm command on {self.a.applied_topic} - starting from the MEASURED arms "
                      "(the grip may loosen)", warn=True)
             return
-        target = np.concatenate([self.applied[a.side] for a in self.arms])
-        q = target.copy()
-        for _ in range(3):
-            for i, arm in enumerate(self.arms):
-                arm.q_cmd = q[7 * i:7 * i + 7].copy()
-            q = target - self.gravity_offset()
-        for i, arm in enumerate(self.arms):
-            arm.q_cmd = q[7 * i:7 * i + 7].copy()
-        self.log(f"--place-only: arms start from the applied command on {self.a.applied_topic}")
+        applied = np.concatenate([self.applied[a.side] for a in self.arms])
+        self.grip_delta = applied - (np.concatenate([a.q_cmd for a in self.arms]) + self.gravity_offset())
+        q = self.base_q()
+        hands = [self.fk(self.data, q, a.ee)[0] for a in self.arms]
+        for i, a in enumerate(self.arms):
+            q[a.q_idx] = self.applied[a.side]
+        cmd_hands = [self.fk(self.data, q, a.ee)[0] for a in self.arms]
+        self.log(f"--place-only: planning from the measured arms; the applied command's grip is kept as an "
+                 f"offset (max {np.degrees(np.abs(self.grip_delta)).max():.0f} deg) - commanded hands "
+                 + ", ".join(f"{a.side} {np.linalg.norm(c - h) * 100:.0f} cm" for a, h, c in zip(self.arms, hands, cmd_hands))
+                 + " from the measured ones")
+
+    def grip_offset(self):
+        """--from applied: the applied command's grip, faded out with the load during unload."""
+        return 0.0 if self.grip_delta is None else self.load_factor() * self.grip_delta
 
     def check_targets(self):
         """Warn about targets that cannot be a box grasp (the sequencer still runs; IK rejects them)."""
@@ -621,7 +650,8 @@ class PickupSequencer(Node):
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = ARM_JOINT_NAMES
-        msg.position = (np.concatenate([a.q_cmd for a in self.arms]) + self.gravity_offset()).tolist()
+        msg.position = (np.concatenate([a.q_cmd for a in self.arms]) + self.gravity_offset()
+                        + self.grip_offset()).tolist()
         self.pub.publish(msg)
         self.flag_pub.publish(Bool(data=self.phase >= PHASES.index("carry")))
         self.step_phase(now)
@@ -647,7 +677,8 @@ class PickupSequencer(Node):
             for arm in self.arms:
                 J = pin.computeFrameJacobian(self.model, self.data, q, arm.ee, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
                 tau[arm.v_idx] += J[:3, arm.v_idx].T @ f_up
-        return np.clip(np.concatenate([tau[a.v_idx] for a in self.arms]) / self.kp, -GRAV_MAX_RAD, GRAV_MAX_RAD)
+        fade = 1.0 if self.comp_t0 is None else float(np.clip((self.now - self.comp_t0) / LOAD_RAMP_S, 0.0, 1.0))
+        return fade * np.clip(np.concatenate([tau[a.v_idx] for a in self.arms]) / self.kp, -GRAV_MAX_RAD, GRAV_MAX_RAD)
 
     def hand_errors_mm(self):
         """Measured hand position vs the commanded end of the current move, per arm; and the measured positions."""
@@ -669,6 +700,8 @@ class PickupSequencer(Node):
 
     def advance(self, now):
         self.phase += 1
+        if self.name == "grip" and not self.measured_start:   # only for --place-only --from measured
+            self.phase += 1
         self.log(f"-> phase {self.phase + 1}: {self.name}" + ("  | load_expected -> True" if self.name == "carry" else ""))
         if self.name == "carry":
             self.load_t0 = now
@@ -764,6 +797,12 @@ def main():
     p.add_argument("--place-only", action="store_true",
                    help="start at the place with the robot already holding the box (grip, lower, ... home); "
                         "start it BEFORE Play, with the balance controller, so the arms never get the policy's default")
+    p.add_argument("--from", dest="start_from", choices=["applied", "measured"], default="applied",
+                   help="--place-only start: applied = keep the command holding the box now (after a mux switch); "
+                        "measured = measured arms + compensation + --grip-squeeze (fresh start)")
+    p.add_argument("--grip-squeeze", type=float, default=0.03,
+                   help="--from measured: press the hands this far into the box (m, 0 = off)")
+    p.add_argument("--wait", action="store_true", help="--place-only: hold until /sequencer_cmd place")
     p.add_argument("--applied-topic", default="/joint_command",
                    help="--place-only: the command the robot gets now (mux output); the arms start from it")
     p.add_argument("--clear", type=float, nargs=3, default=[0.0, 0.40, 0.25], metavar=("X", "Y", "Z"),
