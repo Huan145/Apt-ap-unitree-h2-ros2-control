@@ -39,21 +39,18 @@ be back in control first: /controller_select "balance"):
               and the phase ends
   8 unload    arms still; box-weight compensation (and the --from applied grip) fades out over
               --unload-time (2 s)
-  9 release   hands out by GRASP_REACH_M + --squeeze (the pinch, reversed) and up by
-              RELEASE_UP_M (4 cm, clears the table edge), orientation free
- 10 retract   to the wide pose (as phase 1, position only)
- 11 clear     hands back toward the body at --clear X Y Z (pelvis frame, right = -Y), position only,
-              so the arms swing down beside the body, behind the table edge, not through the table
- 12 home      joint space to HOME_POSE = arm defaults of UNITREE_H2_CFG (walking + balance policies)
- 13 done      hold HOME_POSE -> hand over to the no-box walking controller
+  9 wide      the wide pose of phase 1 (--wide, position only): hands up and out, off the box
+ 10 home      joint space to HOME_POSE = arm defaults of UNITREE_H2_CFG (walking + balance policies)
+ 11 done      hold HOME_POSE -> hand over to the no-box walking controller
 --place-only: the robot already holds the box (no pickup, no FoundationPose targets); box-weight
   compensation on from the start.
   --from applied (default, after a mux switch): plan from the MEASURED arms and keep the command
             APPLIED now on --applied-topic (/joint_command, the one holding the box) as a constant
             joint offset on top: grip = applied - (measured + compensation). The first /arm_targets
-            equals the applied command, the grip holds while lowering and fades out during unload.
-            (A policy grips by commanding the hands far past the box faces - planning from that
-            command would put the hands somewhere they cannot be.)
+            equals the applied command. A policy grips by commanding the hands far past the box faces
+            (freebox: up to 60 cm / 85 deg) - kept while lowering, that drove the hands into the box.
+    grip    so it is swapped for our own squeeze right away: the applied grip fades out over
+            GRIP_SWAP_S while the hands press --grip-squeeze (3 cm) into the box from where they are.
   --from measured (fresh start / nothing holding the box): start from the MEASURED arms with the
             gravity + box compensation ON TOP (lifts the sagging arms), then
     grip    hands in by --grip-squeeze (3 cm) to press the box.
@@ -144,7 +141,7 @@ MIN_MOVE_S = 0.5
 # wide: --wide-out / --wide-up (default 15 / 15 cm) outside / above the standoff, at the target's x
 #       (hands pulled back beside the body put the arm mass behind the robot -> it fell backwards)
 GRASP_REACH_M = 0.05                   # the target is this far outside the box face (visualizer GRASP_REACH)
-RELEASE_UP_M = 0.04                    # release: hands also this far up (clears the table edge), orientation free
+GRIP_SWAP_S = 1.0                      # --from applied: the applied (policy) grip fades out over this, own squeeze in
 ELBOW_IDX, WRIST_PITCH_IDX = 3, 5      # index in each arm's 7 joints (see LEFT_ARM_NAMES)
 # Carry pose: arm joint states saved in H2_box.usd (hands welded to the 0.48 m box). Shoulder pitch ~0
 # (upper arm down), roll +-17 deg (around the box), elbow 0 (= forearm forward on the H2), wrist roll
@@ -158,7 +155,7 @@ CARRY_POSE_DICT = {
     "left_wrist_pitch_joint": -0.00027, "right_wrist_pitch_joint": -0.00063,
     "left_wrist_yaw_joint": 0.05243, "right_wrist_yaw_joint": -0.05767,
 }
-CARRY_STEPS = 10          # IK knots on the carry / lower / release paths
+CARRY_STEPS = 10          # IK knots on the carry / grip / lower paths
 # Arm defaults of UNITREE_H2_CFG (h2_locomotion assets/unitree_h2.py): start pose of the walking AND balance
 # policies; joints not listed there are 0.
 HOME_POSE_DICT = {n: 0.0 for n in ["left_shoulder_yaw_joint", "right_shoulder_yaw_joint", "left_wrist_roll_joint",
@@ -169,18 +166,18 @@ HOME_POSE_DICT.update({"left_shoulder_pitch_joint": 0.28, "right_shoulder_pitch_
                        "left_elbow_joint": 0.52, "right_elbow_joint": 0.52})
 # Phase machine
 PHASES = ["wide", "standoff", "pinch", "tilt", "carry", "grip", "hold",   # grip: --place-only --from measured
-          "lower", "unload", "release", "retract", "clear", "home", "done"]
-PATHS = {"carry", "grip", "lower", "release"}     # straight Cartesian paths through CARRY_STEPS IK knots
+          "lower", "unload", "wide", "home", "done"]       # place: wide = phase 1's pose
+PATHS = {"carry", "grip", "lower"}     # straight Cartesian paths through CARRY_STEPS IK knots
 WAIT = {"hold", "done"}                   # no move; hold waits for /sequencer_cmd "place"
 LIVE = {"standoff"}                       # replanned (after the current move) when the target moved
 RETRY = {"wide", "standoff", "pinch"}     # an IK-rejected arm retries on the next target update
-CONTACT = {"pinch", "tilt", "carry", "grip", "lower", "unload", "release"}   # may be blocked -> end after CONTACT_TIMEOUT_S
+CONTACT = {"pinch", "tilt", "carry", "grip", "lower", "unload"}   # may be blocked -> end after CONTACT_TIMEOUT_S
 CONTACT_TIMEOUT_S = 1.0
 WARN_EVERY_S = 2.0
 WAIT_TIMEOUT_S = 10.0
 LEVEL_WARN_M = 0.03       # warn when the two targets differ in height by more than this
 SETTLE_S, SETTLE_MOVE_MM = 1.0, 2.0      # hands moved < 2 mm in 1 s = settled
-SETTLED_MAX_MM = {"wide": np.inf, "standoff": 30.0, "retract": np.inf, "clear": np.inf, "home": np.inf}   # settled -> ends anyway;
+SETTLED_MAX_MM = {"wide": np.inf, "standoff": 30.0, "home": np.inf}   # settled -> ends anyway;
                                                       # wide is only a clearance via point; standoff next to the box
                                                       # far off = blocked -> keep waiting
 GRAV_MAX_RAD = 0.3        # cap on the gravity-compensation offset per joint
@@ -273,6 +270,7 @@ class PickupSequencer(Node):
         self.measured_start = args.place_only and args.start_from == "measured"
         self.comp_t0 = None                # --from measured: the whole compensation fades in from here
         self.grip_delta = None             # --from applied: (14,) applied - (measured + compensation)
+        self.swap_t0 = None                # --from applied: the applied grip fades out from here
         self.contact_n = 0                 # lower: ticks in a row with the hands held above the command
         if args.place_only and not self.measured_start:
             self.create_subscription(JointState, args.applied_topic, self.cb_applied, SIM_QOS)
@@ -481,7 +479,7 @@ class PickupSequencer(Node):
         return None     # carry: from the post-tilt pose, in the thread
 
     def place_goal(self, arm):
-        """lower / release / retract goal from the CURRENT commanded hands (the box targets are long stale)."""
+        """grip / lower / wide goal from the CURRENT commanded hands (the box targets are long stale)."""
         q = self.base_q()
         (pl, Rl), (pr, Rr) = self.fk(self.data, q, self.arms[0].ee), self.fk(self.data, q, self.arms[1].ee)
         p, R = (pl, Rl) if arm.side == "L" else (pr, Rr)
@@ -495,10 +493,7 @@ class PickupSequencer(Node):
         u /= np.linalg.norm(u)
         if self.name == "grip":      # press the box: hands in from where they are
             return p - arm.sign * self.a.grip_squeeze * u, R
-        if self.name == "release":   # out along the grip axis (the pinch reversed) and up, clear of the table
-            return p + arm.sign * (GRASP_REACH_M + self.a.squeeze) * u + [0.0, 0.0, RELEASE_UP_M], None   # position only
-        xyz = self.a.clear if self.name == "clear" else self.a.wide     # retract: wide pose / clear
-        return np.array(xyz) * [1.0, arm.sign, 1.0], None               # position only, orientation free
+        return np.array(self.a.wide) * [1.0, arm.sign, 1.0], None   # wide: phase 1's pose, position only
 
     def start_plan(self, arm):
         arm.cancel.set()
@@ -547,7 +542,7 @@ class PickupSequencer(Node):
             arm.failed, arm.busy, arm.rejected_for, arm.planned_for = True, False, arm.planned_for, None
             return
         q_arm, e_pos, e_rot = res
-        self.commit(arm, q_arm, (pos, rot), {"pinch": self.a.pinch_time, "lower": self.a.place_time}.get(name, MIN_MOVE_S),
+        self.commit(arm, q_arm, (pos, rot), {"pinch": self.a.pinch_time, "lower": self.a.place_time, "grip": GRIP_SWAP_S}.get(name, MIN_MOVE_S),
                     knots)
         if name == "carry":
             pose = np.array([CARRY_POSE_DICT[n] for n in arm.names])
@@ -581,9 +576,13 @@ class PickupSequencer(Node):
                 self.comp_t0 = self.now
                 self.phase = PHASES.index("grip" if self.a.grip_squeeze > 0 else "hold")
                 self.log("--place-only --from measured: arms lifted by the gravity + box compensation")
-            else:
-                self.phase = PHASES.index("hold")
+            else:                      # applied command, its grip swapped for our squeeze (grip phase)
+                self.phase = PHASES.index("grip" if self.a.grip_squeeze > 0 else "hold")   # before: load_factor
                 self.take_over_applied()
+                self.swap_t0 = self.now
+                if self.a.grip_squeeze > 0 and self.grip_delta is not None:
+                    self.log(f"grip: the applied grip fades out over {GRIP_SWAP_S:.1f}s, own squeeze "
+                             f"{self.a.grip_squeeze * 100:.0f} cm into the box")
             self.log(f"--place-only: box weight {self.a.box_mass:.1f} kg compensated from the start"
                      + (" | waiting for /sequencer_cmd place" if self.a.wait else ""))
             self.log(f"-> phase {self.phase + 1}: {self.name}")
@@ -625,7 +624,11 @@ class PickupSequencer(Node):
 
     def grip_offset(self):
         """--from applied: the applied command's grip, faded out with the load during unload."""
-        return 0.0 if self.grip_delta is None else self.load_factor() * self.grip_delta
+        if self.grip_delta is None:
+            return 0.0
+        swap = 1.0 if self.swap_t0 is None or self.a.grip_squeeze <= 0 else \
+            float(np.clip(1.0 - (self.now - self.swap_t0) / GRIP_SWAP_S, 0.0, 1.0))
+        return self.load_factor() * swap * self.grip_delta
 
     def check_targets(self):
         """Warn about targets that cannot be a box grasp (the sequencer still runs; IK rejects them)."""
@@ -829,12 +832,11 @@ def main():
                    help="--place-only start: applied = keep the command holding the box now (after a mux switch); "
                         "measured = measured arms + compensation + --grip-squeeze (fresh start)")
     p.add_argument("--grip-squeeze", type=float, default=0.03,
-                   help="--from measured: press the hands this far into the box (m, 0 = off)")
+                   help="--place-only grip: press the hands this far into the box from where they are (m, 0 = off; "
+                        "--from applied: 0 keeps the applied grip until unload)")
     p.add_argument("--wait", action="store_true", help="--place-only: hold until /sequencer_cmd place")
     p.add_argument("--applied-topic", default="/joint_command",
                    help="--place-only: the command the robot gets now (mux output); the arms start from it")
-    p.add_argument("--clear", type=float, nargs=3, default=[0.0, 0.40, 0.25], metavar=("X", "Y", "Z"),
-                   help="clear: LEFT hand pose before home, pelvis frame (m); right = (X, -Y, Z)")
     p.add_argument("--place-z", type=float, default=0.10,
                    help="lower: hand midpoint height above the pelvis to put the box down at (m)")
     p.add_argument("--place-dx", type=float, default=0.0, help="lower: also move the box this far forward (m)")
