@@ -843,7 +843,7 @@ def main():
     p.add_argument("--wait", action="store_true", help="--place-only: hold until /sequencer_cmd place")
     p.add_argument("--applied-topic", default="/joint_command",
                    help="--place-only: the command the robot gets now (mux output); the arms start from it")
-    p.add_argument("--place-z", type=float, default=0.10,
+    p.add_argument("--place-z", type=float, default=0.15,
                    help="lower: hand midpoint height above the pelvis to put the box down at (m)")
     p.add_argument("--place-dx", type=float, default=0.0, help="lower: also move the box this far forward (m)")
     p.add_argument("--place-time", type=float, default=2.0, help="lower: minimum duration of the move down (s)")
