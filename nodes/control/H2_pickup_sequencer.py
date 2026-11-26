@@ -30,8 +30,8 @@ not on a timer:
               waits for  ros2 topic pub --once /sequencer_cmd std_msgs/msg/String "{data: place}"
 PLACE (same process: it knows the squeezed grip command + the load; the balance controller must
 be back in control first: /controller_select "balance"):
-  7 lower     both hands straight down (Cartesian, grip width + orientation kept) until their
-              midpoint is --place-z above the pelvis (+ --place-dx forward), >= --place-time s;
+  7 lower     both hands straight down (Cartesian, orientation kept), each to z = --place-z
+              above the pelvis (+ --place-dx forward), >= --place-time s;
               ends after CONTACT_TIMEOUT_S if the table stops the box first
               CONTACT STOP: while lowering, if the measured hands stay --contact-stop (2.5 cm) above
               the command, the table holds the box: the command jumps to the measured arms (no
@@ -486,11 +486,10 @@ class PickupSequencer(Node):
         q = self.base_q()
         (pl, Rl), (pr, Rr) = self.fk(self.data, q, self.arms[0].ee), self.fk(self.data, q, self.arms[1].ee)
         p, R = (pl, Rl) if arm.side == "L" else (pr, Rr)
-        if self.name == "lower":     # midpoint to place_z above the pelvis, both hands by the same offset
-            dz = self.a.place_z - (pl[2] + pr[2]) / 2
-            if arm.side == "L":
-                self.log(f"lower: box {-dz * 100:+.1f} cm down, {self.a.place_dx * 100:+.1f} cm forward "
-                         f"(hands to z {self.a.place_z:+.2f} m in the pelvis frame)", warn=dz > 0)
+        if self.name == "lower":     # each hand to z = place_z above the pelvis (levels the box), x/y kept
+            dz = self.a.place_z - p[2]
+            self.log(f"{arm.side} lower: {-dz * 100:+.1f} cm down, {self.a.place_dx * 100:+.1f} cm forward "
+                     f"(hand to z {self.a.place_z:+.2f} m in the pelvis frame)", warn=dz > 0)
             return p + [self.a.place_dx, 0.0, dz], R
         u = (pl - pr) * [1, 1, 0]
         u /= np.linalg.norm(u)
@@ -844,7 +843,7 @@ def main():
     p.add_argument("--applied-topic", default="/joint_command",
                    help="--place-only: the command the robot gets now (mux output); the arms start from it")
     p.add_argument("--place-z", type=float, default=0.15,
-                   help="lower: hand midpoint height above the pelvis to put the box down at (m)")
+                   help="lower: height of each hand above the pelvis to put the box down at (m)")
     p.add_argument("--place-dx", type=float, default=0.0, help="lower: also move the box this far forward (m)")
     p.add_argument("--place-time", type=float, default=2.0, help="lower: minimum duration of the move down (s)")
     p.add_argument("--contact-stop", type=float, default=0.025,
