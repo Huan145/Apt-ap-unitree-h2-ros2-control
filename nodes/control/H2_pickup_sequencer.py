@@ -39,7 +39,7 @@ be back in control first: /controller_select "balance"):
               and the phase ends
   8 unload    arms still; box-weight compensation (and the --from applied grip) fades out over
               --unload-time (2 s)
-  9 wide      the wide pose of phase 1 (--wide, position only): hands up and out, off the box
+  9 wide      PLACE_WIDE (0.0, +-0.40, 0.25), position only: hands up and out, off the box
  10 home      joint space to HOME_POSE = arm defaults of UNITREE_H2_CFG (walking + balance policies)
  11 done      hold HOME_POSE -> hand over to the no-box walking controller
 --place-only: the robot already holds the box (no pickup, no FoundationPose targets); box-weight
@@ -50,11 +50,11 @@ be back in control first: /controller_select "balance"):
             equals the applied command. A policy grips by commanding the hands far past the box faces
             (freebox: up to 60 cm / 85 deg) - kept while lowering, that drove the hands into the box.
     grip    so it is swapped for our own squeeze right away: the applied grip fades out over
-            GRIP_SWAP_S while the hands press --grip-squeeze (3 cm) into the box from where they are.
+            GRIP_SWAP_S while the hands press --grip-squeeze (5 cm) into the box from where they are.
   --from measured (fresh start / nothing holding the box): start from the MEASURED arms with the
             gravity + box compensation ON TOP (lifts the sagging arms), then
     grip    hands in by --grip-squeeze (3 cm) to press the box.
-  --wait    hold there until /sequencer_cmd "place" (else lower straight away).
+  --wait    hold there until /sequencer_cmd "place" (else lower HOLD_SETTLE_S after the grip).
 load_expected stays True from carry to the end ("flag 1, no load" is in the training distribution;
 1 -> 0 never happens in training).
 
@@ -142,6 +142,8 @@ MIN_MOVE_S = 0.5
 #       (hands pulled back beside the body put the arm mass behind the robot -> it fell backwards)
 GRASP_REACH_M = 0.05                   # the target is this far outside the box face (visualizer GRASP_REACH)
 GRIP_SWAP_S = 1.0                      # --from applied: the applied (policy) grip fades out over this, own squeeze in
+HOLD_SETTLE_S = 0.5                    # --place-only without --wait: hold this long after the grip, then lower
+PLACE_WIDE = (0.0, 0.40, 0.25)         # place 'wide': LEFT hand, pelvis frame (right = -Y); pickup uses --wide
 ELBOW_IDX, WRIST_PITCH_IDX = 3, 5      # index in each arm's 7 joints (see LEFT_ARM_NAMES)
 # Carry pose: arm joint states saved in H2_box.usd (hands welded to the 0.48 m box). Shoulder pitch ~0
 # (upper arm down), roll +-17 deg (around the box), elbow 0 (= forearm forward on the H2), wrist roll
@@ -271,6 +273,7 @@ class PickupSequencer(Node):
         self.comp_t0 = None                # --from measured: the whole compensation fades in from here
         self.grip_delta = None             # --from applied: (14,) applied - (measured + compensation)
         self.swap_t0 = None                # --from applied: the applied grip fades out from here
+        self.hold_t0 = None                # time hold started (--place-only: settle before lowering)
         self.contact_n = 0                 # lower: ticks in a row with the hands held above the command
         if args.place_only and not self.measured_start:
             self.create_subscription(JointState, args.applied_topic, self.cb_applied, SIM_QOS)
@@ -493,7 +496,7 @@ class PickupSequencer(Node):
         u /= np.linalg.norm(u)
         if self.name == "grip":      # press the box: hands in from where they are
             return p - arm.sign * self.a.grip_squeeze * u, R
-        return np.array(self.a.wide) * [1.0, arm.sign, 1.0], None   # wide: phase 1's pose, position only
+        return np.array(PLACE_WIDE) * [1.0, arm.sign, 1.0], None    # wide: hands up and out, position only
 
     def start_plan(self, arm):
         arm.cancel.set()
@@ -739,6 +742,8 @@ class PickupSequencer(Node):
             if self.kp is not None and self.a.box_mass > 0:
                 self.log(f"box weight compensation: {self.a.box_mass:.1f} kg ({self.a.box_mass / 2:.1f} kg per hand), "
                          f"fading in over {LOAD_RAMP_S:.1f}s")
+        if self.name == "hold":
+            self.hold_t0 = now
         if self.name == "unload":
             self.unload_t0 = now
             self.log(f"box weight compensation fading out over {self.a.unload_time:.1f}s")
@@ -771,8 +776,9 @@ class PickupSequencer(Node):
     def step_phase(self, now):
         if self.name == "done" or (self.name == "hold" and not self.place_requested):
             return
-        if self.name == "hold":            # place requested: start phase 7 straight away
-            self.advance(now)
+        if self.name == "hold":            # place requested (--wait: by command; else after HOLD_SETTLE_S)
+            if self.a.wait or self.hold_t0 is None or now - self.hold_t0 >= HOLD_SETTLE_S:
+                self.advance(now)
             return
         if not all(not a.busy and not a.failed and a.q_to is not None and a.t0 is not None and now - a.t0 >= a.dur
                    for a in self.arms):     # a rejected arm still holds its previous move -> not done
@@ -831,7 +837,7 @@ def main():
     p.add_argument("--from", dest="start_from", choices=["applied", "measured"], default="applied",
                    help="--place-only start: applied = keep the command holding the box now (after a mux switch); "
                         "measured = measured arms + compensation + --grip-squeeze (fresh start)")
-    p.add_argument("--grip-squeeze", type=float, default=0.03,
+    p.add_argument("--grip-squeeze", type=float, default=0.05,
                    help="--place-only grip: press the hands this far into the box from where they are (m, 0 = off; "
                         "--from applied: 0 keeps the applied grip until unload)")
     p.add_argument("--wait", action="store_true", help="--place-only: hold until /sequencer_cmd place")
