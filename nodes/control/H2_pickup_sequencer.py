@@ -33,8 +33,14 @@ be back in control first: /controller_select "balance"):
   7 lower     both hands straight down (Cartesian, grip width + orientation kept) until their
               midpoint is --place-z above the pelvis (+ --place-dx forward), >= --place-time s;
               ends after CONTACT_TIMEOUT_S if the table stops the box first
-  8 unload    arms still; box-weight compensation fades out over LOAD_RAMP_S
-  9 release   hands straight out by GRASP_REACH_M + --squeeze (the pinch, reversed)
+              CONTACT STOP: while lowering, if the measured hands stay --contact-stop (2.5 cm) above
+              the command, the table holds the box: the command jumps to the measured arms (no
+              pressing the box into the table - the policy never felt an upward push at the hands)
+              and the phase ends
+  8 unload    arms still; box-weight compensation (and the --from applied grip) fades out over
+              --unload-time (2 s)
+  9 release   hands out by GRASP_REACH_M + --squeeze (the pinch, reversed) and up by
+              RELEASE_UP_M (4 cm, clears the table edge), orientation free
  10 retract   to the wide pose (as phase 1, position only)
  11 clear     hands back toward the body at --clear X Y Z (pelvis frame, right = -Y), position only,
               so the arms swing down beside the body, behind the table edge, not through the table
@@ -138,6 +144,7 @@ MIN_MOVE_S = 0.5
 # wide: --wide-out / --wide-up (default 15 / 15 cm) outside / above the standoff, at the target's x
 #       (hands pulled back beside the body put the arm mass behind the robot -> it fell backwards)
 GRASP_REACH_M = 0.05                   # the target is this far outside the box face (visualizer GRASP_REACH)
+RELEASE_UP_M = 0.04                    # release: hands also this far up (clears the table edge), orientation free
 ELBOW_IDX, WRIST_PITCH_IDX = 3, 5      # index in each arm's 7 joints (see LEFT_ARM_NAMES)
 # Carry pose: arm joint states saved in H2_box.usd (hands welded to the 0.48 m box). Shoulder pitch ~0
 # (upper arm down), roll +-17 deg (around the box), elbow 0 (= forearm forward on the H2), wrist roll
@@ -266,6 +273,7 @@ class PickupSequencer(Node):
         self.measured_start = args.place_only and args.start_from == "measured"
         self.comp_t0 = None                # --from measured: the whole compensation fades in from here
         self.grip_delta = None             # --from applied: (14,) applied - (measured + compensation)
+        self.contact_n = 0                 # lower: ticks in a row with the hands held above the command
         if args.place_only and not self.measured_start:
             self.create_subscription(JointState, args.applied_topic, self.cb_applied, SIM_QOS)
 
@@ -407,13 +415,13 @@ class PickupSequencer(Node):
         or, without q_end, at the previous knot. Returns (ik result of the last knot, as ik(), knots (n+1, 7))."""
         q0 = q[arm.q_idx].copy()
         p0, R0 = self.fk(data, q, arm.ee)
-        slerp = Slerp([0, 1], Rotation.from_matrix(np.stack([R0, rot])))
+        slerp = None if rot is None else Slerp([0, 1], Rotation.from_matrix(np.stack([R0, rot])))   # None: position only
         knots = [q0]
         for k in range(1, CARRY_STEPS + 1):
             f = k / CARRY_STEPS
             qs = q.copy()
             qs[arm.q_idx] = q0 + f * (q_end - q0) if q_end is not None else knots[-1]
-            res = self.ik(data, arm, qs, p0 + f * (pos - p0), slerp(f).as_matrix())
+            res = self.ik(data, arm, qs, p0 + f * (pos - p0), None if slerp is None else slerp(f).as_matrix())
             if res is None or res == "reject":
                 return res, None
             knots.append(res[0])
@@ -487,8 +495,8 @@ class PickupSequencer(Node):
         u /= np.linalg.norm(u)
         if self.name == "grip":      # press the box: hands in from where they are
             return p - arm.sign * self.a.grip_squeeze * u, R
-        if self.name == "release":   # straight out along the grip axis, the pinch reversed
-            return p + arm.sign * (GRASP_REACH_M + self.a.squeeze) * u, R
+        if self.name == "release":   # out along the grip axis (the pinch reversed) and up, clear of the table
+            return p + arm.sign * (GRASP_REACH_M + self.a.squeeze) * u + [0.0, 0.0, RELEASE_UP_M], None   # position only
         xyz = self.a.clear if self.name == "clear" else self.a.wide     # retract: wide pose / clear
         return np.array(xyz) * [1.0, arm.sign, 1.0], None               # position only, orientation free
 
@@ -498,7 +506,7 @@ class PickupSequencer(Node):
             arm.thread.join(timeout=0.2)
         arm.cancel.clear()
         if self.name == "unload":   # arms still; the load compensation ramps out (load_factor)
-            self.commit(arm, arm.q_to.copy(), arm.goal, LOAD_RAMP_S)
+            self.commit(arm, arm.q_to.copy(), arm.goal, self.a.unload_time)
             return
         if self.name == "home":     # joint space to the policies' arm defaults
             self.commit(arm, np.array([HOME_POSE_DICT[n] for n in arm.names]), None)
@@ -654,15 +662,35 @@ class PickupSequencer(Node):
                         + self.grip_offset()).tolist()
         self.pub.publish(msg)
         self.flag_pub.publish(Bool(data=self.phase >= PHASES.index("carry")))
+        if self.name == "lower":
+            self.contact_stop()
         self.step_phase(now)
         self.replan_moved_targets(now)
+
+    def contact_stop(self):
+        """lower: the table holds the box when the measured hands stay above the command -> command = measured
+        arms (stop pressing down), end the move now; step_phase then sees the hands at the command."""
+        if self.a.contact_stop <= 0 or any(a.busy or a.q_to is None for a in self.arms):
+            return
+        q_meas, q_cmd = self.base_q("meas"), self.base_q("cmd")
+        dz = np.mean([self.fk(self.data, q_meas, a.ee)[0][2] - self.fk(self.data, q_cmd, a.ee)[0][2] for a in self.arms])
+        self.contact_n = self.contact_n + 1 if dz >= self.a.contact_stop else 0
+        if self.contact_n < 3:                       # 3 ticks (60 ms) in a row, not a momentary tracking lag
+            return
+        self.contact_n = 0
+        meas = dict(zip(self.joint_state.name, self.joint_state.position))
+        for arm in self.arms:
+            with arm.lock:
+                arm.q_cmd = arm.q_from = arm.q_to = np.array([meas[n] for n in arm.names])
+                arm.knots, arm.t0, arm.dur = None, self.now - 1.0, 1e-3
+        self.log(f"lower: box down - hands {dz * 100:.1f} cm above the command, lowering stopped at the measured arms")
 
     def load_factor(self):
         """0 before carry, then ramps 0 -> 1 over LOAD_RAMP_S: share of the box weight compensated."""
         if self.phase < PHASES.index("carry") or self.load_t0 is None:
             return 0.0
         if self.unload_t0 is not None:     # unload and after: ramp back out
-            return float(np.clip(1.0 - (self.now - self.unload_t0) / LOAD_RAMP_S, 0.0, 1.0))
+            return float(np.clip(1.0 - (self.now - self.unload_t0) / self.a.unload_time, 0.0, 1.0))
         return float(np.clip((self.now - self.load_t0) / LOAD_RAMP_S, 0.0, 1.0))
 
     def gravity_offset(self):
@@ -710,7 +738,7 @@ class PickupSequencer(Node):
                          f"fading in over {LOAD_RAMP_S:.1f}s")
         if self.name == "unload":
             self.unload_t0 = now
-            self.log(f"box weight compensation fading out over {LOAD_RAMP_S:.1f}s")
+            self.log(f"box weight compensation fading out over {self.a.unload_time:.1f}s")
         if self.name == "done":
             self.log("placed, arms home - hand over to the no-box walking controller")
         if self.name not in WAIT:
@@ -811,6 +839,9 @@ def main():
                    help="lower: hand midpoint height above the pelvis to put the box down at (m)")
     p.add_argument("--place-dx", type=float, default=0.0, help="lower: also move the box this far forward (m)")
     p.add_argument("--place-time", type=float, default=2.0, help="lower: minimum duration of the move down (s)")
+    p.add_argument("--contact-stop", type=float, default=0.025,
+                   help="lower: stop when the measured hands stay this far above the command (m, table reached; 0 = off)")
+    p.add_argument("--unload-time", type=float, default=2.0, help="unload: compensation + grip fade-out time (s)")
     p.add_argument("--io", default=POLICY_IO, help="policy_io.json with the joint stiffness (kp) used in the sim")
     p.add_argument("--waist", choices=["measured", "zero"], default="measured",
                    help="waist in the IK model: measured (targets are in the live pelvis frame) or zero (H2_ik_node, pinned torso)")
