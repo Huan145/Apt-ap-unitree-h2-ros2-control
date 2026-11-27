@@ -37,7 +37,8 @@ Confirmed against env.yaml (h2_flat, 2026-05-25_09-21-25 run):
   - observations.policy: base_lin_vel, base_ang_vel, projected_gravity,
     velocity_commands, joint_pos_rel, joint_vel_rel, last_action
     -- ALL have scale=null, clip=null (no hidden scaling anywhere)
-  - init_state.joint_pos defaults (see DEFAULT_JOINT_POS)
+  - init_state.joint_pos defaults (see DEFAULT_JOINT_POS; arm values updated to the
+    arms-down walking training, Nov 2026)
 
 Run (start BEFORE pressing Play in Isaac Sim):
   python3 h2_fullbody_controller.py [--policy policy.pt]
@@ -98,17 +99,21 @@ JOINT_NAMES = [
     "left_wrist_yaw_joint", "right_wrist_yaw_joint",
 ]
 
+# Must equal init_state.joint_pos of the training run that produced the loaded policy.pt:
+# observations use (q - default) and commands are default + 0.5 * action.
+# Arms-down defaults (flat_env_cfg.py, Nov 2026 walking). Policies trained before that used
+# shoulder pitch 0.28, shoulder roll +-0.16, elbow 0.52 - with those, arms stay bent forward.
 DEFAULT_JOINT_POS = {
     "left_hip_pitch_joint": -0.2, "right_hip_pitch_joint": -0.2, "waist_yaw_joint": 0.0,
     "left_hip_roll_joint": 0.0, "right_hip_roll_joint": 0.0, "waist_roll_joint": 0.0,
     "left_hip_yaw_joint": 0.0, "right_hip_yaw_joint": 0.0, "waist_pitch_joint": 0.0,
     "left_knee_joint": 0.42, "right_knee_joint": 0.42, "head_pitch_joint": 0.0,
-    "left_shoulder_pitch_joint": 0.28, "right_shoulder_pitch_joint": 0.28,
+    "left_shoulder_pitch_joint": 0.0, "right_shoulder_pitch_joint": 0.0,
     "left_ankle_roll_joint": 0.0, "right_ankle_roll_joint": 0.0, "head_yaw_joint": 0.0,
-    "left_shoulder_roll_joint": 0.16, "right_shoulder_roll_joint": -0.16,
+    "left_shoulder_roll_joint": 0.15, "right_shoulder_roll_joint": -0.15,
     "left_ankle_pitch_joint": -0.23, "right_ankle_pitch_joint": -0.23,
     "left_shoulder_yaw_joint": 0.0, "right_shoulder_yaw_joint": 0.0,
-    "left_elbow_joint": 0.52, "right_elbow_joint": 0.52,
+    "left_elbow_joint": 1.5, "right_elbow_joint": 1.5,
     "left_wrist_roll_joint": 0.0, "right_wrist_roll_joint": 0.0,
     "left_wrist_pitch_joint": 0.0, "right_wrist_pitch_joint": 0.0,
     "left_wrist_yaw_joint": 0.0, "right_wrist_yaw_joint": 0.0,
